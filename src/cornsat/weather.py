@@ -73,20 +73,28 @@ GDD_CAP = 30.0
 EDD_THRESHOLD = 30.0
 
 
-def fetch_point(lat: float, lon: float, force: bool = False, retries: int = 5) -> pd.DataFrame:
-    """Daily T2M_MAX/T2M_MIN/PRECTOTCORR for a point (cached as parquet, refreshed daily)."""
+def fetch_point(lat: float, lon: float, force: bool = False, retries: int = 5,
+                start: str = START, end: str | None = None) -> pd.DataFrame:
+    """Daily T2M_MAX/T2M_MIN/PRECTOTCORR for a point (cached as parquet, refreshed daily).
+
+    ``start``/``end`` (YYYYMMDD) default to START..today. A non-default range (used for
+    the pre-sample climatology history) is cached in a separate file
+    ``point_<lat>_<lon>_<start>_<end>.parquet`` and never refreshed automatically.
+    """
     WEATHER_DIR.mkdir(parents=True, exist_ok=True)
-    path = WEATHER_DIR / f"point_{lat:.2f}_{lon:.2f}.parquet"
+    custom = start != START or end is not None
+    suffix = f"_{start}_{end}" if custom else ""
+    path = WEATHER_DIR / f"point_{lat:.2f}_{lon:.2f}{suffix}.parquet"
     if path.exists() and not force:
-        if time.time() - path.stat().st_mtime < 24 * 3600:
+        if custom or time.time() - path.stat().st_mtime < 24 * 3600:
             return pd.read_parquet(path)
     params = {
         "parameters": "T2M_MAX,T2M_MIN,PRECTOTCORR",
         "community": "AG",
         "longitude": lon,
         "latitude": lat,
-        "start": START,
-        "end": f"{date.today():%Y%m%d}",
+        "start": start,
+        "end": end or f"{date.today():%Y%m%d}",
         "format": "JSON",
     }
     last_err = None
@@ -115,9 +123,9 @@ def fetch_point(lat: float, lon: float, force: bool = False, retries: int = 5) -
     return df
 
 
-def state_daily(state: str) -> pd.DataFrame:
+def state_daily(state: str, start: str = START, end: str | None = None) -> pd.DataFrame:
     """Equal-weighted (NaN-skipping) mean over the state's points; trailing all-NaN days dropped."""
-    frames = [fetch_point(lat, lon) for _, lat, lon in CORN_POINTS[state]]
+    frames = [fetch_point(lat, lon, start=start, end=end) for _, lat, lon in CORN_POINTS[state]]
     avg = pd.concat(frames).groupby("date").mean()
     avg = avg.sort_index().dropna(how="all").reset_index()
     return avg[["date", "tmax_c", "tmin_c", "precip_mm"]]
@@ -158,11 +166,16 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_weather(states: dict = STATES, save: bool = True) -> pd.DataFrame:
-    """Long table (state, date, ...) incl. national aggregate state='US'."""
+def build_weather(states: dict = STATES, save: bool = True, start: str = START,
+                  end: str | None = None, out_path=None) -> pd.DataFrame:
+    """Long table (state, date, ...) incl. national aggregate state='US'.
+
+    ``start``/``end``/``out_path`` default to the main 2008-today build written to
+    data/processed/weather_daily.parquet; see ``build_weather_presample``.
+    """
     parts, daily = [], {}
     for st in states:
-        daily[st] = state_daily(st)
+        daily[st] = state_daily(st, start=start, end=end)
         d = add_features(daily[st])
         d.insert(0, "state", st)
         parts.append(d)
@@ -177,5 +190,24 @@ def build_weather(states: dict = STATES, save: bool = True) -> pd.DataFrame:
     out = pd.concat(parts, ignore_index=True)
     if save:
         DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
-        out.to_parquet(DATA_PROCESSED / "weather_daily.parquet", index=False)
+        out.to_parquet(out_path or DATA_PROCESSED / "weather_daily.parquet", index=False)
     return out
+
+
+# --- pre-sample history (climatology baseline only) ---------------------------------
+PRESAMPLE_START = "20030101"
+PRESAMPLE_END = "20071231"
+PRESAMPLE_PATH = DATA_PROCESSED / "weather_daily_presample.parquet"
+
+
+def build_weather_presample(states: dict = STATES, save: bool = True) -> pd.DataFrame:
+    """Same table as ``build_weather`` for 2003-01-01..2007-12-31, written to a SEPARATE
+    file (data/processed/weather_daily_presample.parquet) so the main 2008+ table is
+    unchanged. Used only to extend the Phase 5 climatology baseline backwards."""
+    return build_weather(states, save, start=PRESAMPLE_START, end=PRESAMPLE_END,
+                         out_path=PRESAMPLE_PATH)
+
+
+def load_weather_presample() -> pd.DataFrame | None:
+    """Read the pre-sample weather table, or None if it has not been built."""
+    return pd.read_parquet(PRESAMPLE_PATH) if PRESAMPLE_PATH.exists() else None

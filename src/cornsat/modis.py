@@ -333,7 +333,7 @@ def _to_frame(rows: list[dict]) -> pd.DataFrame:
 
 
 def state_composite_stats(state: str, year: int, workers: int = 8, parallel: int = 3,
-                          progress: bool = True) -> pd.DataFrame:
+                          progress: bool = True, cdl_years=None) -> pd.DataFrame:
     """One row per (state, platform, composite) overlapping the season of ``year``.
 
     Columns: state, year, platform, start_date, end_date (16-day window, inclusive),
@@ -345,8 +345,9 @@ def state_composite_stats(state: str, year: int, workers: int = 8, parallel: int
     valid_frac_good (share of corn weight with valid NDVI), n_tiles, cdl_years.
 
     ``workers`` = dask threads per composite, ``parallel`` = composites in flight.
+    ``cdl_years`` optionally overrides the CDL years of the corn weight (pre-sample only).
     """
-    w = season_weight(state, year)
+    w = season_weight(state, year, cdl_years=cdl_years)
     weight = w.values.astype("float32")
     cdl_years = list(w.attrs["cdl_years"])
     comps = group_composites(search_items(state, year))
@@ -359,18 +360,20 @@ def state_composite_stats(state: str, year: int, workers: int = 8, parallel: int
     return _to_frame(rows)
 
 
-def _year_path(year: int) -> Path:
-    return MODIS_DIR / f"{year}.parquet"
+def _year_path(year: int, out_dir: Path | None = None) -> Path:
+    return (MODIS_DIR if out_dir is None else Path(out_dir)) / f"{year}.parquet"
 
 
 def build_year(year: int, states=STATES, workers: int = 8, parallel: int = 3,
-               refresh: bool = False) -> pd.DataFrame:
+               refresh: bool = False, cdl_years=None, out_dir: Path | None = None
+               ) -> pd.DataFrame:
     """All states for one season, cached to data/interim/modis/{year}.parquet.
 
     Resumable: a cached year is returned as-is unless ``refresh``. If the cache lacks
-    some requested states, only those are built and appended.
+    some requested states, only those are built and appended. ``cdl_years`` and
+    ``out_dir`` are for the pre-sample build (see ``build_presample``).
     """
-    path = _year_path(year)
+    path = _year_path(year, out_dir)
     cached = pd.read_parquet(path) if path.exists() else None
     todo = list(states)
     if cached is not None and not refresh:
@@ -380,13 +383,14 @@ def build_year(year: int, states=STATES, workers: int = 8, parallel: int = 3,
     frames = [] if cached is None or refresh else [cached]
     for st in todo:
         t0 = time.time()
-        df = state_composite_stats(st, year, workers=workers, parallel=parallel)
+        df = state_composite_stats(st, year, workers=workers, parallel=parallel,
+                                   cdl_years=cdl_years)
         log.info("%s %d: %d composites in %.0fs", st, year, len(df), time.time() - t0)
         tqdm.write(f"{st} {year}: {len(df)} composites, {time.time() - t0:.0f}s, "
                    f"mean valid_frac {df['valid_frac'].mean():.2f}")
         frames.append(df)
     out = _to_frame(pd.concat(frames, ignore_index=True).to_dict("records"))
-    MODIS_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp.parquet")
     out.to_parquet(tmp, index=False)
     tmp.replace(path)
@@ -411,3 +415,37 @@ def build_all(years=None, states=STATES, workers: int = 8, parallel: int = 3) ->
 def load_modis_state() -> pd.DataFrame:
     """Read data/processed/modis_state.parquet."""
     return pd.read_parquet(OUT_PATH)
+
+
+# --- pre-sample seasons (climatology baseline only) ---------------------------------
+PRESAMPLE_YEARS = range(2003, 2009)
+"""Seasons built only to extend the Phase 5 climatology baseline backwards. Aqua
+(MYD13Q1) starts mid-2002, so 2003 is the first season with both platforms."""
+PRESAMPLE_DIR = MODIS_DIR / "presample"
+PRESAMPLE_OUT_PATH = DATA_PROCESSED / "modis_state_presample.parquet"
+
+
+def build_presample(years=None, states=STATES, workers: int = 8, parallel: int = 3
+                    ) -> pd.DataFrame:
+    """Build pre-sample seasons (default 2003-2008) into a SEPARATE cache
+    (data/interim/modis/presample/) and data/processed/modis_state_presample.parquet,
+    leaving the 2009-2026 outputs untouched. Corn weights use
+    ``cornmask.PRESAMPLE_CDL_YEARS`` (CDL 2008) because no earlier CDL exists; the
+    ``cdl_years`` column records this. Resumable like ``build_all``."""
+    from cornsat.cornmask import PRESAMPLE_CDL_YEARS
+
+    years = list(PRESAMPLE_YEARS if years is None else years)
+    frames = [build_year(y, states, workers=workers, parallel=parallel,
+                         cdl_years=PRESAMPLE_CDL_YEARS, out_dir=PRESAMPLE_DIR)
+              for y in tqdm(years, desc="presample years")]
+    df = pd.concat(frames, ignore_index=True)
+    df = df[df["state"].isin(list(states))]
+    df = df.sort_values(["state", "start_date", "platform"]).reset_index(drop=True)
+    PRESAMPLE_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(PRESAMPLE_OUT_PATH, index=False)
+    return df
+
+
+def load_modis_presample() -> pd.DataFrame | None:
+    """Read data/processed/modis_state_presample.parquet, or None if not built."""
+    return pd.read_parquet(PRESAMPLE_OUT_PATH) if PRESAMPLE_OUT_PATH.exists() else None
