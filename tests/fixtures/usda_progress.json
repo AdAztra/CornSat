@@ -1,0 +1,4 @@
+{"data": [
+ {"source_desc":"SURVEY","commodity_desc":"CORN","statisticcat_desc":"PROGRESS","unit_desc":"PCT PLANTED","short_desc":"CORN - PROGRESS, MEASURED IN PCT PLANTED","agg_level_desc":"NATIONAL","state_alpha":"US","state_fips_code":"99","year":"2012","reference_period_desc":"WEEK #36","week_ending":"2012-09-02","freq_desc":"WEEKLY","Value":"100"},
+ {"source_desc":"SURVEY","commodity_desc":"CORN","statisticcat_desc":"PROGRESS","unit_desc":"PCT MATURE","short_desc":"CORN - PROGRESS, MEASURED IN PCT MATURE","agg_level_desc":"NATIONAL","state_alpha":"US","state_fips_code":"99","year":"2012","reference_period_desc":"WEEK #36","week_ending":"2012-09-02","freq_desc":"WEEKLY","Value":"(D)"}
+]}
