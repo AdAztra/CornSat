@@ -7,7 +7,12 @@ Usage:
 Reads data/processed/{features_trading,usda_yield,zcz_front_dec}.parquet and the US
 final-yield history 1990-2008 (NASS Quick Stats via usda.query, cached). Writes
 data/processed/{model_predictions,backtest_trades}.parquet, reports/*.csv and
-reports/figures/*.png. Prints the headline table. Design: reports/phase6_design.md.
+reports/figures/*.png (including stageA_threeway.csv: W+C / W+C+S / W+C+H on the cells
+where all three predict, and stageB_sat_shared.csv: S- vs H-strategies on the seasons where
+both have a prediction). Prints the headline table. Design: reports/phase6_design.md.
+
+Caveat: HLS (group H) seasons before 2022 are an archive reconstruction (granules produced
+months to years after acquisition); real-time HLS latency exists only from 2022.
 """
 
 from __future__ import annotations
@@ -56,6 +61,8 @@ def stage_a(feat, targets, forecasts, targets_huber):
     acc = M.accuracy_table(pd.concat([preds, loso14], ignore_index=True))
     paired = pd.concat([M.paired_comparison(preds, scheme="wf"),
                         M.paired_comparison(preds, scheme="loso")], ignore_index=True)
+    threeway = pd.concat([M.threeway_comparison(preds, scheme="wf"),
+                          M.threeway_comparison(preds, scheme="loso")], ignore_index=True)
     # sensitivity: fixed alpha = 10, and a Huber trend (walk-forward only)
     sens = []
     for label, tg, alphas in (("main (OLS trend, LOO alpha)", targets, M.ALPHAS),
@@ -68,7 +75,7 @@ def stage_a(feat, targets, forecasts, targets_huber):
         sens.append(s)
     sens = pd.concat(sens, axis=1)
     sens.index.name = "set (mean WF RMSE over snapshots)"
-    return preds, acc, paired, sens
+    return preds, acc, paired, sens, threeway
 
 
 # --- Stage B --------------------------------------------------------------------------------
@@ -121,6 +128,9 @@ def stage_b(feat, targets, forecasts, prices, n_boot, n_rand):
                             "seasons_s_better": int((seasons[g_only] > 0).sum()),
                             "seasons_s_worse": int((seasons[g_only] < 0).sum())})
     sat = pd.DataFrame(sat)
+    # S- vs H-strategies like for like: only seasons where every satellite set has a
+    # prediction that uses its satellite group
+    sat_shared = B.sat_shared_table(res, signals, n_boot)
 
     # sensitivity: thresholds, next-day execution, fixed alpha
     model_strats = [c for c in B.strategy_names(positions) if "|" in c]
@@ -147,7 +157,8 @@ def stage_b(feat, targets, forecasts, prices, n_boot, n_rand):
 
     trades = pd.concat([w.assign(strategy=n) for n, (d, w) in res.items()], ignore_index=True)
     return dict(schedule=schedule, signals=signals, rb_preds=rb_preds, positions=positions,
-                res=res, summary=summary, seasons=seasons, rob=rob, sat=sat, thr=thr,
+                res=res, summary=summary, seasons=seasons, rob=rob, sat=sat,
+                sat_shared=sat_shared, thr=thr,
                 sens=sens, trades=trades)
 
 
@@ -263,9 +274,13 @@ def fig_2012(feat, path):
     plt.close(fig)
 
 
-def print_h_report(preds, paired_h, sat_h, best_h):
+HLS_OPERATIONAL_FROM = 2022
+
+
+def print_h_report(preds, paired_h, sat_h, best_h, threeway=None, sat_shared=None):
     """H (HLS 30 m) section: skipped notice, or paired tests on the season intersection plus
-    the underpowered-test caveat."""
+    the underpowered-test and archive-reconstruction caveats, the three-way Stage A table
+    and the shared-season Stage B comparison."""
     h_preds = preds[(preds["scheme"] == "wf") & preds["set"].str.split("+").str[-1].eq("H")
                     & preds["pred"].notna() & ~preds["h_dropped"].astype(bool)]
     print("\n== H (HLS 30 m) satellite group ==")
@@ -273,6 +288,10 @@ def print_h_report(preds, paired_h, sat_h, best_h):
         print("H sets skipped: no hls_ columns in features_trading (or no walk-forward "
               "prediction yet).")
         return
+    print(f"CAVEAT: HLS seasons before {HLS_OPERATIONAL_FROM} are an archive reconstruction "
+          f"(CMR production dates months to years after acquisition); real-time HLS latency "
+          f"exists only from {HLS_OPERATIONAL_FROM}. H results that use earlier seasons (for "
+          f"training or testing) are not what a trader could have had in real time.")
     first = int(h_preds["season"].min())
     print(f"NOTE: H walk-forward predictions start in {first}: a season needs MIN_TRAIN="
           f"{M.MIN_TRAIN} earlier seasons with H available, so the national H test covers "
@@ -286,6 +305,17 @@ def print_h_report(preds, paired_h, sat_h, best_h):
         print(sat_h.round(3).to_string(index=False))
     if best_h:
         print(f"best with H: {best_h}")
+    if threeway is not None and len(threeway):
+        print("\nStage A three-way (W+C / W+C+S / W+C+H) on the cells where all three predict, "
+              "ALL = season mean")
+        t = threeway[threeway["snapshot"] == "ALL"]
+        print(t[["scheme", "base", "with_s", "n", "seasons", "rmse_W+C", "rmse_W+C+S",
+                 "rmse_W+C+H", "mean_d_se", "n_s_better", "p_ttest", "p_wilcoxon"]]
+              .round(3).to_string(index=False))
+    if sat_shared is not None and len(sat_shared):
+        print("\nStage B on the shared seasons (every satellite set has a prediction):")
+        print(sat_shared.drop(columns=["seasons"]).round(1).to_string(index=False))
+        print(f"shared seasons: {sat_shared['seasons'].iloc[0]}")
 
 
 # --- main --------------------------------------------------------------------------------
@@ -320,11 +350,12 @@ def main() -> None:
     prices = pd.read_parquet(DATA_PROCESSED / "zcz_front_dec.parquet")
 
     # Stage A
-    preds, acc, paired, sens_a = stage_a(feat, targets, forecasts, targets_h)
+    preds, acc, paired, sens_a, threeway = stage_a(feat, targets, forecasts, targets_h)
     targets.round(3).to_csv(reports / "stageA_targets.csv")
     acc.round(4).to_csv(reports / "stageA_accuracy.csv", index=False)
     paired.round(4).to_csv(reports / "stageA_paired.csv", index=False)
     sens_a.round(3).to_csv(reports / "stageA_sensitivity.csv")
+    threeway.round(4).to_csv(reports / "stageA_threeway.csv", index=False)
 
     # Stage B
     b = stage_b(feat, targets, forecasts, prices, n_boot, n_rand)
@@ -332,6 +363,7 @@ def main() -> None:
     summ.round(4).to_csv(reports / "stageB_summary.csv")
     b["seasons"].round(1).to_csv(reports / "stageB_season_pnl.csv")
     b["sat"].round(4).to_csv(reports / "stageB_satellite.csv", index=False)
+    b["sat_shared"].round(4).to_csv(reports / "stageB_sat_shared.csv", index=False)
     b["sens"].round(1).to_csv(reports / "stageB_sensitivity.csv")
     b["thr"].pivot_table(index="strategy", columns="threshold", values="net_pnl").round(1).to_csv(
         reports / "stageB_threshold_sensitivity.csv")
@@ -389,7 +421,8 @@ def main() -> None:
     print(b["sat"][~sat_h].round(3).to_string(index=False))
     print(f"\nbest Stage A set (mean WF RMSE): {best_set}; best strategy: {best}; "
           f"best with S: {best_s}")
-    print_h_report(preds, pw[is_h], b["sat"][sat_h], best_by_group["H"])
+    print_h_report(preds, pw[is_h], b["sat"][sat_h], best_by_group["H"], threeway,
+                   b["sat_shared"])
     print(f"wrote {predictions_path.name}, {trades_path.name}, reports/*.csv, reports/figures/*.png")
 
 

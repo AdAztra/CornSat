@@ -319,14 +319,24 @@ def test_asof_le_date_real(real_panel):
 
 # --- (b) truncation test ------------------------------------------------------------
 def _truncation(inputs, full, pairs):
+    h = inputs.get("hls")
+    hls_last = F.sat_available_date(h, F.HLS_SPEC).max() if h is not None else None
+    hls_removed = 0  # dates at which truncation removed some HLS rows
+    checked = 0
     for geo, d in pairs:
         d = pd.Timestamp(d)
         tr = truncate(inputs, d)
         assert len(tr["modis"]) < len(inputs["modis"])  # something future was removed
         assert len(tr["weather"]) < len(inputs["weather"])
-        if inputs.get("hls") is not None:
-            assert len(tr["hls"]) < len(inputs["hls"])
+        if h is not None:
             assert F.HLS_SPEC.asof_col in full
+            # after the latest HLS availability nothing is left to remove (e.g. late Oct of
+            # the last season); before it, truncation must remove something
+            if d < hls_last:
+                assert len(tr["hls"]) < len(h)
+            else:
+                assert len(tr["hls"]) == len(h)
+            hls_removed += len(tr["hls"]) < len(h)
         part = F.build_features(tr["modis"], tr["weather"], tr["usda"], seasons=[d.year],
                                 hls=tr["hls"])
         a = full[(full["geo"] == geo) & (full["date"] == d)].iloc[0]
@@ -338,6 +348,10 @@ def _truncation(inputs, full, pairs):
         fb = part[part["date"] <= d][cols]
         pd.testing.assert_frame_equal(fa.reset_index(drop=True), fb.reset_index(drop=True),
                                       check_exact=True)
+        checked += 1
+    assert checked == len(pairs)  # every date was checked
+    if h is not None:
+        assert hls_removed >= 1  # the HLS path was really exercised by truncation
 
 
 def test_truncation_synthetic(syn_inputs, syn_panel):
