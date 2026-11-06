@@ -7,11 +7,14 @@ Usage:
                                                             # ~4.5 min/season, resumable;
                                                             # NASA POWER weather 2003-2007)
     uv run python scripts/build_features.py --no-presample  # ignore pre-sample files
+    uv run python scripts/build_features.py --no-hls        # MODIS-only satellite columns
 
 Writes data/processed/features_daily.parquet (long: one row per geo x calendar day,
 Apr 1 - Oct 31, 2009-2026) and data/processed/features_trading.parquet (US features
 plus per-state columns suffixed _<state> on ZCZ front-December trading dates). USDA
-features are added automatically when data/processed/usda_*.parquet exist.
+features are added automatically when data/processed/usda_*.parquet exist; HLS
+features (hls_* columns, appended after all others) when data/processed/hls_state.parquet
+exists (plus hls_state_presample.parquet for the climatology, unless --no-presample).
 """
 
 from __future__ import annotations
@@ -37,7 +40,9 @@ def build_presample() -> None:
 def sanity(panel: pd.DataFrame, trading: pd.DataFrame) -> None:
     us = panel[panel["geo"] == "US"].copy()
     late = us[(us["date"].dt.month == 8) | ((us["date"].dt.month == 7) & (us["date"].dt.day >= 20))]
-    tbl = late.groupby("season")[["ndvi_anom", "evi_anom", "ndvi_z", "edd30_jul"]].mean()
+    cols = ["ndvi_anom", "evi_anom", "ndvi_z", "edd30_jul"]
+    cols += [c for c in ("hls_ndvi_anom", "hls_ndvi_z") if c in us]
+    tbl = late.groupby("season")[cols].mean()
     print("\nUS mean anomalies, Jul 20 - Aug 31:")
     print(tbl.round(4).to_string())
     a1 = us[(us["date"].dt.month == 8) & (us["date"].dt.day == 1)].set_index("season")
@@ -55,16 +60,19 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--presample", action="store_true", help="build the pre-sample history first")
     p.add_argument("--no-presample", action="store_true", help="do not use pre-sample files")
+    p.add_argument("--no-hls", action="store_true",
+                   help="leave out the HLS columns even if hls_state.parquet exists")
     args = p.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     if args.presample:
         build_presample()
-    panel, trading = F.build_and_save(presample=not args.no_presample)
-    for c in ("modis_asof", "weather_asof", "usda_asof"):
+    panel, trading = F.build_and_save(presample=not args.no_presample, hls=not args.no_hls)
+    for c in ("modis_asof", "weather_asof", "usda_asof", F.HLS_SPEC.asof_col):
         if c in panel:
             assert (panel[c].isna() | (panel[c] <= panel["date"])).all(), c
     print(f"wrote {F.FEATURES_DAILY_PATH} {panel.shape} and {F.FEATURES_TRADING_PATH} "
-          f"{trading.shape}; USDA features: {'usda_asof' in panel}")
+          f"{trading.shape}; USDA features: {'usda_asof' in panel}; "
+          f"HLS features: {F.HLS_SPEC.asof_col in panel}")
     with np.errstate(all="ignore"):
         sanity(panel, trading)
 
