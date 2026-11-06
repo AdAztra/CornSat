@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import warnings
+from pathlib import Path
 
 import matplotlib
 
@@ -37,6 +38,7 @@ TRADE_SEASONS = range(2014, 2027)
 # figure style (light surface, recessive axes; categorical slots 1-3 + neutral)
 SURF, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 C1, C2, C3, NEUTRAL = "#2a78d6", "#eb6834", "#1baf7a", "#8a8984"
+C4 = "#8c5bd8"  # fifth slot, only used when an H strategy is plotted
 plt.rcParams.update({
     "figure.facecolor": SURF, "axes.facecolor": SURF, "savefig.facecolor": SURF,
     "axes.edgecolor": GRID, "axes.labelcolor": INK2, "xtick.color": INK2,
@@ -94,25 +96,30 @@ def stage_b(feat, targets, forecasts, prices, n_boot, n_rand):
         rob.append(r)
     rob = pd.DataFrame(rob).set_index("strategy")
 
-    # satellite question: W+C+S vs W+C with the same rule; S vs flat
+    # satellite question, per group g in SAT_GROUPS (S = MODIS, H = HLS; H only when its
+    # strategies exist): W+C+g vs W+C with the same rule; g alone vs flat
     sat = []
-    for sig in B.SIGNALS:
-        a, b = f"{sig}|W+C+S", f"{sig}|W+C"
-        bs = B.block_bootstrap(res[a][1], n_boot, seed=2, other=res[b][1])
-        sa, sb = seasons[a], seasons[b]
-        sat.append({"signal": sig, "with_s": a, "without_s": b,
-                    "pnl_with_s": summary.loc[a, "net_pnl"], "pnl_without_s": summary.loc[b, "net_pnl"],
-                    "diff": bs["diff"], "diff_lo": bs["diff_lo"], "diff_hi": bs["diff_hi"],
-                    "p_diff_le0": bs["p_diff_le0"], "seasons_s_better": int((sa > sb).sum()),
-                    "seasons_s_worse": int((sa < sb).sum())})
-        s_only = f"{sig}|S"
-        bs = B.block_bootstrap(res[s_only][1], n_boot, seed=3)
-        sat.append({"signal": sig, "with_s": s_only, "without_s": "flat",
-                    "pnl_with_s": summary.loc[s_only, "net_pnl"], "pnl_without_s": 0.0,
-                    "diff": summary.loc[s_only, "net_pnl"], "diff_lo": bs["pnl_lo"],
-                    "diff_hi": bs["pnl_hi"], "p_diff_le0": bs["p_pnl_le0"],
-                    "seasons_s_better": int((seasons[s_only] > 0).sum()),
-                    "seasons_s_worse": int((seasons[s_only] < 0).sum())})
+    for g in M.SAT_GROUPS:
+        for sig in B.SIGNALS:
+            a, b = f"{sig}|W+C+{g}", f"{sig}|W+C"
+            if a in res:
+                bs = B.block_bootstrap(res[a][1], n_boot, seed=2, other=res[b][1])
+                sa, sb = seasons[a], seasons[b]
+                sat.append({"signal": sig, "with_s": a, "without_s": b,
+                            "pnl_with_s": summary.loc[a, "net_pnl"],
+                            "pnl_without_s": summary.loc[b, "net_pnl"],
+                            "diff": bs["diff"], "diff_lo": bs["diff_lo"], "diff_hi": bs["diff_hi"],
+                            "p_diff_le0": bs["p_diff_le0"], "seasons_s_better": int((sa > sb).sum()),
+                            "seasons_s_worse": int((sa < sb).sum())})
+            g_only = f"{sig}|{g}"
+            if g_only in res:
+                bs = B.block_bootstrap(res[g_only][1], n_boot, seed=3)
+                sat.append({"signal": sig, "with_s": g_only, "without_s": "flat",
+                            "pnl_with_s": summary.loc[g_only, "net_pnl"], "pnl_without_s": 0.0,
+                            "diff": summary.loc[g_only, "net_pnl"], "diff_lo": bs["pnl_lo"],
+                            "diff_hi": bs["pnl_hi"], "p_diff_le0": bs["p_pnl_le0"],
+                            "seasons_s_better": int((seasons[g_only] > 0).sum()),
+                            "seasons_s_worse": int((seasons[g_only] < 0).sum())})
     sat = pd.DataFrame(sat)
 
     # sensitivity: thresholds, next-day execution, fixed alpha
@@ -123,7 +130,7 @@ def stage_b(feat, targets, forecasts, prices, n_boot, n_rand):
     for sig, grid in grids.items():
         for t in grid:
             pos_t = B.positions_table(signals, thresholds={sig: t})
-            names = [f"{sig}|{s}" for s in B.TRADE_SETS]
+            names = [f"{sig}|{s}" for s in B.signal_sets(signals)]
             r_t = B.run_strategies(prices, pos_t, names=names)
             for n in names:
                 d, w = r_t[n]
@@ -185,7 +192,7 @@ def _equity(daily):
 
 def fig_equity(res, lines, path):
     fig, ax = plt.subplots(figsize=(10, 4))
-    colors = [C1, C2, C3, NEUTRAL]
+    colors = [C1, C2, C3, C4, NEUTRAL] if len(lines) > 4 else [C1, C2, C3, NEUTRAL]
     seas = None
     for (name, label), col in zip(lines, colors):
         eq, seas = _equity(res[name][0])
@@ -212,7 +219,7 @@ def fig_season_bars(seasons, cols, path):
     x = np.arange(len(s))
     w = 0.8 / len(cols)
     fig, ax = plt.subplots(figsize=(10, 3.8))
-    for i, ((c, label), col) in enumerate(zip(cols, [C1, C2, C3])):
+    for i, ((c, label), col) in enumerate(zip(cols, [C1, C2, C3, C4])):
         ax.bar(x + (i - (len(cols) - 1) / 2) * w, s[c], width=w * 0.92, color=col, label=label)
     ax.axhline(0, color=INK2, lw=0.8)
     ax.set_xticks(x)
@@ -256,16 +263,53 @@ def fig_2012(feat, path):
     plt.close(fig)
 
 
+def print_h_report(preds, paired_h, sat_h, best_h):
+    """H (HLS 30 m) section: skipped notice, or paired tests on the season intersection plus
+    the underpowered-test caveat."""
+    h_preds = preds[(preds["scheme"] == "wf") & preds["set"].str.split("+").str[-1].eq("H")
+                    & preds["pred"].notna() & ~preds["h_dropped"].astype(bool)]
+    print("\n== H (HLS 30 m) satellite group ==")
+    if h_preds.empty:
+        print("H sets skipped: no hls_ columns in features_trading (or no walk-forward "
+              "prediction yet).")
+        return
+    first = int(h_preds["season"].min())
+    print(f"NOTE: H walk-forward predictions start in {first}: a season needs MIN_TRAIN="
+          f"{M.MIN_TRAIN} earlier seasons with H available, so the national H test covers "
+          f"few seasons ({first}-{int(h_preds['season'].max())}) and is underpowered.")
+    print("Paired tests are computed on the intersection of seasons where both sets have a "
+          "prediction (see 'seasons').")
+    if len(paired_h):
+        print(paired_h[["base", "with_s", "n", "seasons", "rmse_base", "rmse_with_s",
+                        "n_s_better", "p_ttest", "p_wilcoxon"]].round(3).to_string(index=False))
+    if len(sat_h):
+        print(sat_h.round(3).to_string(index=False))
+    if best_h:
+        print(f"best with H: {best_h}")
+
+
 # --- main --------------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--quick", action="store_true", help="1,000 bootstrap / random draws")
+    ap.add_argument("--out-dir", type=Path, default=None,
+                    help="write everything under OUT_DIR/{reports,processed} instead of the "
+                         "project's reports/ and data/processed/ (leaves those untouched)")
     args = ap.parse_args()
+    if args.out_dir is None:
+        reports, figs = REPORTS, FIGS
+        predictions_path, trades_path = M.PREDICTIONS_PATH, TRADES_PATH
+    else:
+        reports, figs = args.out_dir / "reports", args.out_dir / "reports" / "figures"
+        predictions_path = args.out_dir / "processed" / M.PREDICTIONS_PATH.name
+        trades_path = args.out_dir / "processed" / TRADES_PATH.name
+        predictions_path.parent.mkdir(parents=True, exist_ok=True)
+        figs.mkdir(parents=True, exist_ok=True)
     n_boot, n_rand = (1000, 1000) if args.quick else (10_000, 5_000)
     logging.basicConfig(level=logging.WARNING)
     warnings.filterwarnings("ignore", category=RuntimeWarning)
-    REPORTS.mkdir(exist_ok=True)
-    FIGS.mkdir(exist_ok=True)
+    reports.mkdir(exist_ok=True)
+    figs.mkdir(exist_ok=True)
 
     us = M.load_us_yields()
     final = M.us_final_yields(us, M.fetch_final_history())
@@ -277,20 +321,20 @@ def main() -> None:
 
     # Stage A
     preds, acc, paired, sens_a = stage_a(feat, targets, forecasts, targets_h)
-    targets.round(3).to_csv(REPORTS / "stageA_targets.csv")
-    acc.round(4).to_csv(REPORTS / "stageA_accuracy.csv", index=False)
-    paired.round(4).to_csv(REPORTS / "stageA_paired.csv", index=False)
-    sens_a.round(3).to_csv(REPORTS / "stageA_sensitivity.csv")
+    targets.round(3).to_csv(reports / "stageA_targets.csv")
+    acc.round(4).to_csv(reports / "stageA_accuracy.csv", index=False)
+    paired.round(4).to_csv(reports / "stageA_paired.csv", index=False)
+    sens_a.round(3).to_csv(reports / "stageA_sensitivity.csv")
 
     # Stage B
     b = stage_b(feat, targets, forecasts, prices, n_boot, n_rand)
     summ = b["summary"].join(b["rob"])
-    summ.round(4).to_csv(REPORTS / "stageB_summary.csv")
-    b["seasons"].round(1).to_csv(REPORTS / "stageB_season_pnl.csv")
-    b["sat"].round(4).to_csv(REPORTS / "stageB_satellite.csv", index=False)
-    b["sens"].round(1).to_csv(REPORTS / "stageB_sensitivity.csv")
+    summ.round(4).to_csv(reports / "stageB_summary.csv")
+    b["seasons"].round(1).to_csv(reports / "stageB_season_pnl.csv")
+    b["sat"].round(4).to_csv(reports / "stageB_satellite.csv", index=False)
+    b["sens"].round(1).to_csv(reports / "stageB_sensitivity.csv")
     b["thr"].pivot_table(index="strategy", columns="threshold", values="net_pnl").round(1).to_csv(
-        REPORTS / "stageB_threshold_sensitivity.csv")
+        reports / "stageB_threshold_sensitivity.csv")
 
     # processed outputs
     sp = preds.assign(kind="snapshot")
@@ -299,24 +343,32 @@ def main() -> None:
     rp = rp.merge(b["signals"][["season", "date", "usda"]], on=["season", "date"], how="left")
     allp = pd.concat([sp, rp], ignore_index=True)
     allp["train_seasons"] = allp["train_seasons"].apply(lambda v: [int(x) for x in v])
-    allp.to_parquet(M.PREDICTIONS_PATH, index=False)
-    b["trades"].to_parquet(TRADES_PATH, index=False)
+    allp.to_parquet(predictions_path, index=False)
+    b["trades"].to_parquet(trades_path, index=False)
 
     # figures
     wf = acc[acc["scheme"] == "wf"]
-    mean_rmse = wf[wf["set"].isin(M.SET_NAMES)].groupby("set")["rmse"].mean()
+    # H sets cover fewer seasons (late walk-forward start), so they never compete for best_set
+    no_h = [n for n in M.SET_NAMES if "H" not in n.split("+")]
+    mean_rmse = wf[wf["set"].isin(no_h)].groupby("set")["rmse"].mean()
     best_set = mean_rmse.idxmin()
-    fig_pred_vs_actual(preds, best_set, FIGS / "pred_vs_actual_wf.png")
+    fig_pred_vs_actual(preds, best_set, figs / "pred_vs_actual_wf.png")
     model_strats = [c for c in b["summary"].index if "|" in c]
     ranked = b["summary"].loc[model_strats, "net_pnl"].sort_values(ascending=False)
     best = ranked.index[0]
-    best_s = next(n for n in ranked.index if n.endswith("S"))
-    lines = [("always_short", "always short"), (best, f"best model: {best}"),
-             (best_s, f"best with S: {best_s}"), ("always_long", "always long")]
-    fig_equity(b["res"], lines, FIGS / "equity_curves.png")
-    fig_season_bars(b["seasons"], [("always_short", "always short"), (best, best),
-                                   (best_s, best_s)], FIGS / "season_pnl.png")
-    fig_2012(feat, FIGS / "timeline_2012.png")
+    best_by_group = {g: next((n for n in ranked.index if n.endswith(g)), None)
+                     for g in M.SAT_GROUPS}
+    best_s = best_by_group["S"]
+    lines = [("always_short", "always short"), (best, f"best model: {best}")]
+    bars = [("always_short", "always short"), (best, best)]
+    for g, n in best_by_group.items():
+        if n is not None:
+            lines.append((n, f"best with {g}: {n}"))
+            bars.append((n, n))
+    lines.append(("always_long", "always long"))
+    fig_equity(b["res"], lines, figs / "equity_curves.png")
+    fig_season_bars(b["seasons"], bars, figs / "season_pnl.png")
+    fig_2012(feat, figs / "timeline_2012.png")
 
     # print headline
     pd.set_option("display.width", 200)
@@ -325,17 +377,20 @@ def main() -> None:
     print(piv[list(M.SNAPSHOTS)].round(2).to_string())
     print("\n== Stage A: does S help? walk-forward paired squared errors (ALL = season mean) ==")
     pw = paired[(paired["scheme"] == "wf") & (paired["snapshot"] == "ALL")]
-    print(pw[["base", "with_s", "n", "rmse_base", "rmse_with_s", "n_s_better",
-              "p_ttest", "p_wilcoxon"]].round(3).to_string(index=False))
+    is_h = pw["with_s"].str.split("+").str[-1] == "H"
+    print(pw[~is_h][["base", "with_s", "n", "rmse_base", "rmse_with_s", "n_s_better",
+                     "p_ttest", "p_wilcoxon"]].round(3).to_string(index=False))
     cols = ["net_pnl", "sharpe", "hit_rate", "max_dd", "trades", "costs", "pnl_lo", "pnl_hi",
             "diff_vs_short", "p_not_beat_short", "p_random_full", "p_random_own"]
     print("\n== Stage B: walk-forward backtest 2014-2026, 1 ZCZ, after costs ==")
     print(summ[cols].sort_values("net_pnl", ascending=False).round(2).to_string())
     print("\n== Satellite vs no satellite (same rule) ==")
-    print(b["sat"].round(3).to_string(index=False))
+    sat_h = b["sat"]["with_s"].str.endswith("H")
+    print(b["sat"][~sat_h].round(3).to_string(index=False))
     print(f"\nbest Stage A set (mean WF RMSE): {best_set}; best strategy: {best}; "
           f"best with S: {best_s}")
-    print(f"wrote {M.PREDICTIONS_PATH.name}, {TRADES_PATH.name}, reports/*.csv, reports/figures/*.png")
+    print_h_report(preds, pw[is_h], b["sat"][sat_h], best_by_group["H"])
+    print(f"wrote {predictions_path.name}, {trades_path.name}, reports/*.csv, reports/figures/*.png")
 
 
 if __name__ == "__main__":
