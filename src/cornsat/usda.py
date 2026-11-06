@@ -148,6 +148,28 @@ def final_yield_available_date(year: int) -> pd.Timestamp:
     return crop_production_release_date(year + 1, 1)
 
 
+def next_business_day_after(ts) -> pd.Timestamp:
+    """First weekday, non-federal-holiday date strictly after ts's calendar date."""
+    return pd.Timestamp(ts).normalize() + _BDAY
+
+
+def today() -> pd.Timestamp:
+    """Injectable 'today' (tests monkeypatch ``usda.today``)."""
+    return pd.Timestamp.today().normalize()
+
+
+def forecast_available_date(year: int, month: int, load_times=None) -> pd.Timestamp:
+    """Forecast usable date: next business day after the (max) load_time date when it
+    parses and lies in the forecast's year/month; never earlier than the rule date."""
+    rule = crop_production_release_date(year, month)
+    lt = pd.to_datetime(pd.Series([] if load_times is None else list(load_times)),
+                        errors="coerce").dropna()
+    lt = lt[(lt.dt.year == year) & (lt.dt.month == month)]
+    if lt.empty:
+        return rule
+    return max(rule, next_business_day_after(lt.max()))
+
+
 # ---------------------------------------------------------------- parsers
 
 def _geo(df: pd.DataFrame):
@@ -224,16 +246,29 @@ def parse_yield(df: pd.DataFrame) -> pd.DataFrame:
     df["period"] = np.where(df["reference_period_desc"] == "YEAR", "FINAL",
                             df["reference_period_desc"].str.slice(7, 10))
     df["year"] = df["year"].astype(int)
-    wide = df.pivot_table(index=["geo", "year", "period"], columns="col", values="value",
+    keys = ["geo", "year", "period"]
+    wide = df.pivot_table(index=keys, columns="col", values="value",
                           aggfunc="first", dropna=False)
     wide = wide.reindex(columns=["yield_bu_ac", "production_bu", "area_harvested_ac"]).reset_index()
     wide.columns.name = None
+    if "load_time" in df:
+        df["_lt"] = pd.to_datetime(df["load_time"], errors="coerce")
+        lts = df.groupby(keys)["_lt"].apply(list).to_dict()
+    else:
+        lts = {}
 
     def avail(r):
         if r["period"] == "FINAL":
             return final_yield_available_date(r["year"])
-        return crop_production_release_date(r["year"], MONTHS[r["period"]])
+        return forecast_available_date(r["year"], MONTHS[r["period"]],
+                                       lts.get((r["geo"], r["year"], r["period"])))
 
+    # "YEAR" is not final during the season: drop FINAL rows not yet released.
+    t = today()
+    is_final = wide["period"] == "FINAL"
+    unreleased = is_final & ((wide["year"] >= t.year) | wide["year"].map(
+        lambda y: final_yield_available_date(y) > t))
+    wide = wide[~unreleased].copy()
     wide["available_date"] = wide.apply(avail, axis=1)
     return wide[cols].sort_values(["geo", "year", "available_date"]).reset_index(drop=True)
 

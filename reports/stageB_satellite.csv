@@ -1,0 +1,7 @@
+signal,with_s,without_s,pnl_with_s,pnl_without_s,diff,diff_lo,diff_hi,p_diff_le0,seasons_s_better,seasons_s_worse
+level,level|W+C+S,level|W+C,-3980.0,-7470.0,3490.0,-10470.5,18087.5,0.3079,6,7
+level,level|S,flat,-827.5,0.0,-827.5,-10755.0,8123.0,0.5377,7,5
+change,change|W+C+S,change|W+C,-7970.0,4287.5,-12257.5,-24315.125,-289.625,0.9783,4,9
+change,change|S,flat,2272.5,0.0,2272.5,-10912.5625,15665.1875,0.3802,6,6
+vs_usda,vs_usda|W+C+S,vs_usda|W+C,-645.0,-587.5,-57.5,-6320.375,6210.125,0.5125,6,4
+vs_usda,vs_usda|S,flat,-5442.5,0.0,-5442.5,-14375.875,3217.5,0.8878,4,8
