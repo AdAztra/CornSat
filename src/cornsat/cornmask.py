@@ -435,36 +435,54 @@ def _with_retries(fn, tries: int = 4):
             return fn()
         except Exception as e:  # noqa: BLE001
             last = e
-            time.sleep(2 * (attempt + 1))
+            time.sleep(5 * 2**attempt)
     raise RuntimeError(f"CDL window read failed: {last}")
+
+
+_pc_cdl_items_cache: dict[int, list] = {}
+_pc_cdl_items_lock = threading.Lock()
+# lon/lat box around the core and extra states; one STAC search per CDL year
+_PC_CDL_SEARCH_BBOX = [-104.2, 35.9, -80.4, 49.5]
+
+
+def _pc_cdl_items(cdl_year: int) -> list:
+    """usda-cdl cropland items (unsigned) for one year, searched once and cached.
+
+    One search per block window got the Planetary Computer STAC API to rate-limit the
+    mask build, so the year's item list is fetched once and filtered locally."""
+    import pystac_client
+
+    with _pc_cdl_items_lock:
+        if cdl_year in _pc_cdl_items_cache:
+            return _pc_cdl_items_cache[cdl_year]
+
+        def search():
+            cat = pystac_client.Client.open(STAC_URL)
+            return list(
+                cat.search(
+                    collections=["usda-cdl"],
+                    bbox=_PC_CDL_SEARCH_BBOX,
+                    datetime=f"{cdl_year}-01-01/{cdl_year}-12-31",
+                    limit=500,
+                ).items()
+            )
+
+        items = [
+            it
+            for it in _with_retries(search, tries=6)
+            if it.properties.get("usda_cdl:type") == "cropland" and "cropland" in it.assets
+        ]
+        _pc_cdl_items_cache[cdl_year] = items
+        return items
 
 
 def _pc_cdl_window(dst: np.ndarray, aff: Affine, cdl_year: int) -> int:
     import planetary_computer as pc
-    import pystac_client
-    from rasterio.warp import transform_bounds
     from shapely.geometry import box
 
     h, w = dst.shape
     bounds = (aff.c, aff.f - h * CDL_RES, aff.c + w * CDL_RES, aff.f)
-    bbox = transform_bounds(CDL_CRS, "EPSG:4326", *bounds, densify_pts=5)
-
-    def search():
-        cat = pystac_client.Client.open(STAC_URL, modifier=pc.sign_inplace)
-        return list(
-            cat.search(
-                collections=["usda-cdl"],
-                bbox=list(bbox),
-                datetime=f"{cdl_year}-01-01/{cdl_year}-12-31",
-                limit=50,
-            ).items()
-        )
-
-    items = [
-        it
-        for it in _with_retries(search)
-        if it.properties.get("usda_cdl:type") == "cropland" and "cropland" in it.assets
-    ]
+    items = _pc_cdl_items(cdl_year)
     win = box(*bounds)
     n = 0
     for it in items:
@@ -474,7 +492,8 @@ def _pc_cdl_window(dst: np.ndarray, aff: Affine, cdl_year: int) -> int:
             continue
 
         def read(href=it.assets["cropland"].href):
-            with rasterio.Env(**_GDAL_HTTP_ENV), rasterio.open(href) as ds:
+            # sign at read time: SAS tokens expire, and the item list is cached per year
+            with rasterio.Env(**_GDAL_HTTP_ENV), rasterio.open(pc.sign(href)) as ds:
                 return _paste_codes(dst, aff, ds)
 
         n += _with_retries(read)
