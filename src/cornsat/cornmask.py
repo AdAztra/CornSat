@@ -360,9 +360,21 @@ def corn_fraction(state_abbr: str, cdl_year: int, refresh: bool = False) -> xr.D
     return out
 
 
-def season_weight(state_abbr: str, season_year: int) -> xr.DataArray:
-    """Mean corn fraction over ``mask_years(season_year)`` (no look-ahead), on modis_geobox."""
-    years = mask_years(season_year)
+PRESAMPLE_CDL_YEARS = [CDL_FIRST_YEAR]
+"""CDL years used to corn-weight *pre-sample* MODIS seasons (2003-2008), which have no
+prior CDL (national coverage starts 2008). Those seasons feed only the Phase 5
+climatology baseline (normalisation), never a tradable feature; corn location in the
+five core states is very stable year to year, so the 2008 mask is a close proxy."""
+
+
+def season_weight(state_abbr: str, season_year: int, cdl_years=None) -> xr.DataArray:
+    """Mean corn fraction over ``mask_years(season_year)`` (no look-ahead), on modis_geobox.
+
+    ``cdl_years`` optionally overrides the CDL years averaged (used only for the
+    pre-sample climatology seasons, see PRESAMPLE_CDL_YEARS); default keeps
+    ``mask_years``.
+    """
+    years = mask_years(season_year) if cdl_years is None else [int(y) for y in cdl_years]
     if not years:
         raise ValueError(f"no CDL years available for season {season_year}")
     fracs = [corn_fraction(state_abbr, y) for y in years]
