@@ -7,7 +7,8 @@ import pytest
 
 from cornsat import model as M
 
-ALL_FEATURES = sorted({f for fs in M.FEATURE_GROUPS.values() for f in fs})
+ALL_FEATURES = sorted({f for g, fs in M.FEATURE_GROUPS.items() if g != "H" for f in fs})
+HLS_FEATURES = M.FEATURE_GROUPS["H"]
 
 
 def synth_final(first=1990, last=2026, seed=0) -> pd.Series:
@@ -17,10 +18,14 @@ def synth_final(first=1990, last=2026, seed=0) -> pd.Series:
                      name="final")
 
 
-def synth_features(seasons=range(2009, 2021), seed=3) -> tuple[pd.DataFrame, pd.DataFrame]:
+def synth_features(seasons=range(2009, 2021), seed=3, hls_from: int | None = None,
+                   ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Business-day feature table (Apr-Oct) whose features carry a per-season latent u,
-    plus targets with surprise = 5 u + noise."""
+    plus targets with surprise = 5 u + noise. No hls_ columns unless ``hls_from`` is given:
+    then they exist, carrying the same latent u, but are NaN for seasons < ``hls_from``
+    (drawn from a separate rng, so the other columns are the same either way)."""
     rng = np.random.default_rng(seed)
+    rng_h = np.random.default_rng(seed + 1000)
     parts, tg = [], []
     for y in seasons:
         u = rng.normal()
@@ -30,6 +35,10 @@ def synth_features(seasons=range(2009, 2021), seed=3) -> tuple[pd.DataFrame, pd.
                           "close": 450 + rng.normal(0, 5, len(d)).cumsum()})
         for i, c in enumerate(ALL_FEATURES):
             f[c] = u * ramp * (1 + 0.1 * i) + rng.normal(0, 0.5, len(d))
+        if hls_from is not None:
+            for i, c in enumerate(HLS_FEATURES):
+                f[c] = (u * ramp * (1 + 0.1 * i) + rng_h.normal(0, 0.5, len(d))
+                        if y >= hls_from else np.nan)
         parts.append(f)
         tg.append({"season": y, "final": np.nan, "trend": 170.0, "surprise": 5 * u + rng.normal()})
     return pd.concat(parts, ignore_index=True), pd.DataFrame(tg).set_index("season")
@@ -167,3 +176,104 @@ def test_feature_missing_in_training_is_dropped_not_seasons():
     tX.loc[[2009, 2011, 2013], "ge_chg_2w"] = np.nan  # only 4 complete seasons with it
     out = M.predict_one(tX, tg.loc[pool, "surprise"], snap.loc[2016], M.FEATURE_SETS["C"])
     assert out["used"] == "ge" and out["n_train"] == 7 and out["fallback"]
+
+
+# --- H (HLS) group -------------------------------------------------------------------------------
+def test_h_group_and_sets_registered():
+    assert M.FEATURE_GROUPS["H"] == ["hls_ndvi_z", "hls_evi_anom_cum", "hls_ndvi_trend_anom"]
+    assert M.SET_NAMES[:7] == ["W", "C", "S", "W+C", "W+S", "C+S", "W+C+S"]  # order unchanged
+    assert M.SET_NAMES[7:] == ["H", "W+H", "C+H", "W+C+H", "W+C+S+H"]
+    assert M.SAT_GROUPS == ("S", "H") and M.S_FEATURES == set(M.FEATURE_GROUPS["S"])
+    assert M.FEATURE_SETS["W+C+S+H"] == [*M.FEATURE_SETS["W+C+S"], *M.FEATURE_GROUPS["H"]]
+
+
+def _stage_a(feat_raw, tg):
+    feat = M.prepare_features(feat_raw)
+    fc = pd.DataFrame(columns=["year", "period", "yield_bu_ac", "available_date"])
+    fc["available_date"] = pd.to_datetime(fc["available_date"])
+    return feat, M.snapshot_predictions(feat, tg, fc, snapshots={"Aug15": (8, 15)})
+
+
+def test_without_hls_columns_h_sets_skipped_and_s_outputs_unchanged(caplog):
+    raw, tg = synth_features()
+    assert not any(c.startswith("hls_") for c in raw.columns)
+    M._WARNED_MISSING.clear()
+    with caplog.at_level("WARNING", logger="cornsat.model"):
+        feat, preds = _stage_a(raw, tg)
+        # a second consumer in the same process must not log again
+        M.rebalance_predictions(feat, tg, pd.DataFrame(
+            {"season": [2019], "date": [feat[feat["season"] == 2019]["date"].iloc[60]]}))
+    msgs = [r for r in caplog.records if "skipping feature sets" in r.getMessage()]
+    assert len(msgs) == 1 and "hls_ndvi_z" in msgs[0].getMessage()
+    sets = set(preds["set"])
+    assert not any("H" in s.split("+") for s in sets)
+    assert {"W", "C", "S", "W+C", "W+S", "C+S", "W+C+S"} <= sets
+    # the S-set predictions equal an independent per-set predict_one on the same data
+    snap = M.snapshot_rows(feat, 8, 15)
+    with_t = [int(y) for y in tg.index]
+    for s in ("S", "W+C+S"):
+        for Y in (2015, 2019):
+            pool = [y for y in with_t if y < Y]
+            ref = M.predict_one(snap.loc[pool], tg.loc[pool, "surprise"], snap.loc[Y],
+                                M.FEATURE_SETS[s])
+            got = preds[(preds["scheme"] == "wf") & (preds["set"] == s) & (preds["season"] == Y)]
+            assert got["pred"].iloc[0] == pytest.approx(ref["pred"])
+            assert not got["h_dropped"].iloc[0]
+    # adding hls_ columns does not change any non-H output
+    raw_h, _ = synth_features(hls_from=2009)
+    _, preds_h = _stage_a(raw_h, tg)
+    a = preds[preds["set"].isin(sets)].drop(columns=["train_seasons"]).reset_index(drop=True)
+    b = preds_h[preds_h["set"].isin(sets)].drop(columns=["train_seasons"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b)
+
+
+def test_h_sets_run_with_hls_columns_and_h_dropped_flag():
+    raw, tg = synth_features(hls_from=2009)
+    feat, preds = _stage_a(raw, tg)
+    assert {"H", "W+H", "C+H", "W+C+H", "W+C+S+H"} <= set(preds["set"])
+    snap = M.snapshot_rows(feat, 8, 15)
+    pool = list(range(2009, 2019))
+    x = snap.loc[2019].copy()
+    x[M.FEATURE_GROUPS["H"]] = np.nan  # HLS outage in the target row
+    full = M.predict_one(snap.loc[pool], tg.loc[pool, "surprise"], x, M.FEATURE_SETS["W+C+H"])
+    base = M.predict_one(snap.loc[pool], tg.loc[pool, "surprise"], x, M.FEATURE_SETS["W+C"])
+    assert full["h_dropped"] and not full["s_dropped"] and full["fallback"]
+    assert full["pred"] == pytest.approx(base["pred"])
+    assert not base["h_dropped"] and not base["s_dropped"]
+    # dropping only S leaves h_dropped False
+    x2 = snap.loc[2019].copy()
+    x2[M.FEATURE_GROUPS["S"]] = np.nan
+    both = M.predict_one(snap.loc[pool], tg.loc[pool, "surprise"], x2, M.FEATURE_SETS["W+C+S+H"])
+    assert both["s_dropped"] and not both["h_dropped"]
+    h_only = M.predict_one(snap.loc[pool], tg.loc[pool, "surprise"], x, M.FEATURE_SETS["H"])
+    assert np.isnan(h_only["pred"]) and h_only["h_dropped"] and not h_only["s_dropped"]
+
+
+def test_h_predictions_start_late_and_paired_uses_season_intersection():
+    raw, tg = synth_features(seasons=range(2009, 2027), hls_from=2016)
+    tg.loc[2026, "surprise"] = np.nan  # no target yet
+    feat, preds = _stage_a(raw, tg)
+    wf = preds[(preds["scheme"] == "wf")]
+    h_seasons = sorted(wf[(wf["set"] == "H") & wf["pred"].notna()]["season"])
+    w_seasons = sorted(wf[(wf["set"] == "W") & wf["pred"].notna()]["season"])
+    assert h_seasons[0] == 2016 + M.MIN_TRAIN and w_seasons[0] == 2009 + M.MIN_TRAIN
+    pc = M.paired_comparison(preds, scheme="wf")
+    pairs = set(zip(pc["base"], pc["with_s"]))
+    assert {("W+C", "W+C+H"), ("W+C+S", "W+C+H"), ("S", "H"), ("W", "W+H"),
+            ("C", "C+H"), ("W+C", "W+C+S")} <= pairs
+    allrow = pc[(pc["base"] == "W") & (pc["with_s"] == "W+H") & (pc["snapshot"] == "ALL")].iloc[0]
+    # intersection: H seasons that have a target, not all of W's seasons
+    assert allrow["n"] == len([s for s in h_seasons if s <= 2025])
+    assert allrow["seasons"] == f"{h_seasons[0]}-2025"
+    wc = pc[(pc["base"] == "W") & (pc["with_s"] == "W+S") & (pc["snapshot"] == "ALL")].iloc[0]
+    assert wc["n"] > allrow["n"] and wc["seasons"].startswith(str(w_seasons[0]))
+
+
+def test_paired_comparison_skips_pairs_with_missing_sets():
+    raw, tg = synth_features()
+    _, preds = _stage_a(raw, tg)  # no hls columns -> no H sets
+    pc = M.paired_comparison(preds, scheme="wf")
+    assert not pc["with_s"].str.endswith("H").any()
+    assert set(zip(pc["base"], pc["with_s"])) == {("W+C", "W+C+S"), ("W", "W+S"), ("C", "C+S")}
+    assert "seasons" in pc.columns
+    assert M.paired_comparison(preds.iloc[0:0], scheme="wf").empty

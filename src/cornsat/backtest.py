@@ -26,7 +26,8 @@ import numpy as np
 import pandas as pd
 
 from cornsat.config import CONTRACT_BUSHELS, TRADE_END, TRADE_START
-from cornsat.model import ALPHAS, MIN_TRAIN, rebalance_predictions, usda_surprise_at
+from cornsat.model import (ALPHAS, MIN_TRAIN, SAT_GROUPS, rebalance_predictions,
+                           usda_surprise_at)
 
 DOLLARS_PER_CENT = CONTRACT_BUSHELS / 100.0  # 50
 COMMISSION_RT = 5.0
@@ -34,7 +35,7 @@ SLIPPAGE_CENTS = 0.25
 COST_PER_SIDE = COMMISSION_RT / 2 + SLIPPAGE_CENTS * DOLLARS_PER_CENT  # 15
 WEEKS_PER_YEAR = 52
 
-TRADE_SETS = ["W", "C", "W+C", "W+C+S", "S"]
+TRADE_SETS = ["W", "C", "W+C", "W+C+S", "S", "H", "W+C+H"]
 SIGNALS = ["level", "change", "vs_usda"]
 THRESHOLDS = {"level": 2.0, "change": 0.5, "vs_usda": 2.0}
 BENCHMARKS = ["always_short", "always_long", "flat"]
@@ -181,25 +182,37 @@ def compute_signals(feat: pd.DataFrame, targets: pd.DataFrame, forecasts: pd.Dat
                     schedule: pd.DataFrame, sets=TRADE_SETS, alphas=ALPHAS,
                     min_train: int = MIN_TRAIN) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(wide, long). wide: one row per rebalance with the walk-forward prediction per set
-    (``pred_<set>``), the same-model change (``delta_<set>``), flags (``fallback_<set>``, ``sdrop_<set>``) and ``usda`` (latest
-    USDA forecast surprise usable at the rebalance date). long: ``rebalance_predictions``."""
+    (``pred_<set>``), the same-model change (``delta_<set>``), flags (``fallback_<set>``,
+    ``sdrop_<set>`` / ``hdrop_<set>``: the set's S (H) group was dropped) and ``usda`` (latest USDA forecast surprise usable at the rebalance date).
+    Sets with a feature column missing from ``feat`` (H before the HLS source exists) get
+    no columns at all. long: ``rebalance_predictions``."""
     preds = rebalance_predictions(feat, targets, schedule, sets, alphas, min_train)
     wide = schedule.copy()
     wide["date"] = pd.to_datetime(wide["date"])
-    for s in sets:
+    ran = set(preds["set"]) if "set" in preds else set()
+    for s in [s for s in sets if s in ran]:
         p = preds[preds["set"] == s].set_index(["season", "date"])
         key = pd.MultiIndex.from_frame(wide[["season", "date"]])
         wide[f"pred_{s}"] = p["pred"].reindex(key).to_numpy()
         wide[f"fallback_{s}"] = p["fallback"].reindex(key).to_numpy()
-        wide[f"sdrop_{s}"] = p["s_dropped"].reindex(key).to_numpy()
+        for g in SAT_GROUPS:
+            wide[f"{g.lower()}drop_{s}"] = p[f"{g.lower()}_dropped"].reindex(key).to_numpy()
         wide[f"delta_{s}"] = p["delta"].reindex(key).to_numpy()
     wide["usda"] = [usda_surprise_at(forecasts, targets, y, d)
                     for y, d in zip(wide["season"], wide["date"])]
     return wide, preds
 
 
+def signal_sets(signals: pd.DataFrame, sets=TRADE_SETS) -> list[str]:
+    """The ``sets`` that have a prediction column in ``signals`` (H sets are absent when
+    the hls_ features do not exist)."""
+    return [s for s in sets if f"pred_{s}" in signals.columns]
+
+
 def positions_table(signals: pd.DataFrame, sets=TRADE_SETS, thresholds=None) -> pd.DataFrame:
-    """Position per strategy ("<signal>|<set>" and benchmarks) at every rebalance."""
+    """Position per strategy ("<signal>|<set>" and benchmarks) at every rebalance, for the
+    ``sets`` present in ``signals``."""
+    sets = signal_sets(signals, sets)
     thr = {**THRESHOLDS, **(thresholds or {})}
     out = signals[["season", "date"]].copy()
     for s in sets:

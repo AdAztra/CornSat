@@ -208,3 +208,39 @@ def test_delta_uses_same_model_and_handles_missing_columns():
     d2 = pd.DataFrame({"season": [2015, 2016], "date": [pd.Timestamp("2015-08-04"), d0]})
     p3 = M.rebalance_predictions(feat, tg, d2, sets=["W"])
     assert p3["delta"].isna().all()
+
+
+# --- H (HLS) trade sets ---------------------------------------------------------------------------
+def _signals_inputs(**synth_kw):
+    raw, tg = synth_features(seasons=range(2009, 2017), **synth_kw)
+    feat = M.prepare_features(raw)
+    fc = pd.DataFrame({"year": [2009], "period": ["AUG"], "yield_bu_ac": [170.0],
+                       "available_date": [pd.Timestamp(2009, 8, 12)]})
+    td = {y: pd.DatetimeIndex(feat.loc[feat["season"] == y, "date"]) for y in (2015, 2016)}
+    return feat, tg, fc, B.build_schedule(td)
+
+
+def test_trade_sets_include_h_and_skip_it_without_hls_columns():
+    assert {"H", "W+C+H"} <= set(B.TRADE_SETS)
+    feat, tg, fc, sched = _signals_inputs()
+    sig, long = B.compute_signals(feat, tg, fc, sched)
+    assert B.signal_sets(sig) == ["W", "C", "W+C", "W+C+S", "S"]  # same as before H existed
+    assert {"sdrop_W+C+S", "hdrop_W+C+S"} <= set(sig.columns)
+    assert not [c for c in sig.columns if c.endswith("+H") or c.endswith("_H")]
+    pos = B.positions_table(sig)
+    assert not [c for c in B.strategy_names(pos) if c.split("|")[-1].split("+")[-1] == "H"]
+    assert set(long["set"]) == {"W", "C", "W+C", "W+C+S", "S"}
+
+
+def test_h_signals_and_hdrop_flags_with_hls_columns():
+    feat, tg, fc, sched = _signals_inputs(hls_from=2009)
+    sig, _ = B.compute_signals(feat, tg, fc, sched)
+    assert {"pred_H", "pred_W+C+H", "hdrop_H", "hdrop_W+C+H", "sdrop_H"} <= set(sig.columns)
+    assert sig["pred_W+C+H"].notna().any() and not sig["hdrop_W+C+H"].astype(bool).any()
+    assert not sig["sdrop_W+C+H"].astype(bool).any()
+    pos = B.positions_table(sig)
+    assert {"level|H", "change|W+C+H", "vs_usda|H"} <= set(B.strategy_names(pos))
+    # non-H signals are the same with or without the hls columns
+    feat0, tg0, fc0, sched0 = _signals_inputs()
+    sig0, _ = B.compute_signals(feat0, tg0, fc0, sched0)
+    pd.testing.assert_frame_equal(sig0, sig[sig0.columns])

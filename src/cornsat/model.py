@@ -10,8 +10,10 @@ never contains information from its own season or later.
 Features
 --------
 Rows of ``features_trading`` (one per ZCZ trading date; row d is as of the morning of d).
-FEATURE_GROUPS lists the W (weather), C (crop conditions) and S (satellite) columns.
-FEATURE_SETS are the groups and their combinations.
+FEATURE_GROUPS lists the W (weather), C (crop conditions), S (MODIS satellite) and H (HLS
+30 m satellite) columns. FEATURE_SETS are the groups and their combinations. H columns
+(``hls_*``) may be absent from ``features_trading``; sets containing H are then skipped
+(``available_sets``).
 
 Model
 -----
@@ -57,12 +59,33 @@ FEATURE_GROUPS: dict[str, list[str]] = {
     "W": ["edd30_cum", "precip_30d_anom", "gdd_cum_anom"],
     "C": ["ge", "ge_chg_2w"],
     "S": ["ndvi_z", "evi_anom_cum", "ndvi_trend_anom"],
+    "H": ["hls_ndvi_z", "hls_evi_anom_cum", "hls_ndvi_trend_anom"],  # pre-registered
 }
-SET_NAMES = ["W", "C", "S", "W+C", "W+S", "C+S", "W+C+S"]
+SET_NAMES = ["W", "C", "S", "W+C", "W+S", "C+S", "W+C+S",
+             "H", "W+H", "C+H", "W+C+H", "W+C+S+H"]
 FEATURE_SETS: dict[str, list[str]] = {
     name: [f for g in name.split("+") for f in FEATURE_GROUPS[g]] for name in SET_NAMES
 }
-S_FEATURES = set(FEATURE_GROUPS["S"])
+SAT_GROUPS = ("S", "H")
+SAT_FEATURES: dict[str, set[str]] = {g: set(FEATURE_GROUPS[g]) for g in SAT_GROUPS}
+S_FEATURES = SAT_FEATURES["S"]  # alias
+_WARNED_MISSING: set[tuple[str, ...]] = set()
+
+
+def available_sets(feat: pd.DataFrame, sets: Iterable[str]) -> list[str]:
+    """``sets`` minus those with a feature column missing from ``feat`` (e.g. the hls_
+    columns before the HLS source is added). Skipped sets are logged once per distinct
+    set of missing columns; they are never filled."""
+    sets = list(sets)
+    ok = [s for s in sets if all(f in feat.columns for f in FEATURE_SETS[s])]
+    skipped = [s for s in sets if s not in ok]
+    if skipped:
+        missing = tuple(sorted({f for s in skipped for f in FEATURE_SETS[s] if f not in feat.columns}))
+        if missing not in _WARNED_MISSING:
+            _WARNED_MISSING.add(missing)
+            log.warning("skipping feature sets %s: missing feature columns %s", skipped,
+                        list(missing))
+    return ok
 
 SNAPSHOTS: dict[str, tuple[int, int]] = {
     "Jun15": (6, 15), "Jul01": (7, 1), "Jul15": (7, 15), "Aug01": (8, 1),
@@ -236,9 +259,9 @@ def predict_one(train_X: pd.DataFrame, train_y: pd.Series, x: pd.Series, feature
        happens early in June, when ``ge_chg_2w`` is not yet reported in some years.
     3. If no feature is left, or fewer than ``min_train`` seasons remain, the prediction
        is NaN.
-    ``fallback``: some feature of the set was dropped. ``s_dropped``: the set has S
-    features and none of them was used, so the model became the one without S (2025 after
-    Aug 10)."""
+    ``fallback``: some feature of the set was dropped. ``s_dropped`` / ``h_dropped``: the
+    set has S (H) features and none of them was used, so the model became the one without
+    that group (S: 2025 after Aug 10)."""
     used = [f for f in features if pd.notna(x.get(f, np.nan))]
     ty = train_y.rename("_y").astype(float).dropna()
     tX = train_X.loc[train_X.index.isin(ty.index)]
@@ -248,9 +271,10 @@ def predict_one(train_X: pd.DataFrame, train_y: pd.Series, x: pd.Series, feature
             break
         miss = tX[used].isna().sum()
         used.remove(miss.idxmax())
-    has_s = any(f in S_FEATURES for f in features)
+    dropped = {g: any(f in fs for f in features) and not any(f in fs for f in used)
+               for g, fs in SAT_FEATURES.items()}
     out = {"pred": np.nan, "used": ",".join(used), "fallback": len(used) < len(features),
-           "s_dropped": has_s and not any(f in S_FEATURES for f in used),
+           "s_dropped": dropped["S"], "h_dropped": dropped["H"],
            "n_train": 0, "train_seasons": [], "alpha": np.nan,
            "pred_prev": np.nan, "delta": np.nan}
     if not used:
@@ -277,8 +301,10 @@ def snapshot_predictions(feat: pd.DataFrame, targets: pd.DataFrame, forecasts: p
                          alphas=ALPHAS, min_train: int = MIN_TRAIN) -> pd.DataFrame:
     """Stage A predictions at the fixed snapshots for every scheme, feature set and
     baseline. ``feat`` from ``prepare_features``. Walk-forward rows exist only for seasons
-    with at least ``min_train`` prior seasons; LOSO rows for seasons with a target."""
+    with at least ``min_train`` prior seasons; LOSO rows for seasons with a target. Sets
+    with a feature column missing from ``feat`` are skipped (``available_sets``)."""
     with_t = _with_targets(targets)
+    sets = available_sets(feat, sets)
     rows = []
     for label, (m, d) in snapshots.items():
         snap = snapshot_rows(feat, m, d)
@@ -301,14 +327,15 @@ def snapshot_predictions(feat: pd.DataFrame, targets: pd.DataFrame, forecasts: p
                       "usda": usda_surprise_at(forecasts, targets, Y, x["date"])}
                 for s, v in bl.items():
                     rows.append({**base, "set": s, "pred": v, "used": "", "fallback": False,
-                                 "s_dropped": False, "n_train": len(pool) if s == "mean" else 0,
+                                 "s_dropped": False, "h_dropped": False,
+                                 "n_train": len(pool) if s == "mean" else 0,
                                  "train_seasons": pool if s == "mean" else [],
                                  "alpha": np.nan})
     return pd.DataFrame(rows)
 
 
 def rebalance_predictions(feat: pd.DataFrame, targets: pd.DataFrame, dates: pd.DataFrame,
-                          sets=("W", "C", "W+C", "W+C+S", "S"), alphas=ALPHAS,
+                          sets=("W", "C", "W+C", "W+C+S", "S", "H", "W+C+H"), alphas=ALPHAS,
                           min_train: int = MIN_TRAIN) -> pd.DataFrame:
     """Walk-forward predictions refit at each (season, date) of ``dates``.
 
@@ -320,8 +347,10 @@ def rebalance_predictions(feat: pd.DataFrame, targets: pd.DataFrame, dates: pd.D
     ``delta`` (the change signal) = model_d(features at d) - model_d(features at the
     previous rebalance date of the same season in ``dates``), both scored with the model
     fitted at d; NaN on a season's first rebalance or when the earlier row lacks a used
-    column (see ``predict_one``)."""
+    column (see ``predict_one``). Sets with a feature column missing from ``feat`` are
+    skipped (``available_sets``)."""
     with_t = _with_targets(targets)
+    sets = available_sets(feat, sets)
     ax = AsofIndex(feat)
     by_date = feat.set_index("date")
     rows = []
@@ -361,15 +390,33 @@ def accuracy_table(preds: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
-def paired_comparison(preds: pd.DataFrame, pairs=(("W+C", "W+C+S"), ("W", "W+S"), ("C", "C+S")),
-                      scheme: str = "wf") -> pd.DataFrame:
+PAIRS = (("W+C", "W+C+S"), ("W", "W+S"), ("C", "C+S"),
+         ("W+C", "W+C+H"), ("W+C+S", "W+C+H"), ("S", "H"), ("W", "W+H"), ("C", "C+H"))
+
+
+def paired_comparison(preds: pd.DataFrame, pairs=PAIRS, scheme: str = "wf") -> pd.DataFrame:
     """Paired squared-error comparison, base (A) vs with satellite (B), per snapshot and
     pooled ("ALL": per-season mean over snapshots, so n stays the number of seasons).
-    d = e_A^2 - e_B^2 (> 0 means S helped)."""
+    d = e_A^2 - e_B^2 (> 0 means the added satellite group helped; column ``with_s`` is B
+    whichever group it adds).
+
+    A pair is evaluated only when both sets have predictions, and only on the
+    intersection of (snapshot, season) cells where both have a prediction, so pairs
+    involving H (whose walk-forward predictions start late) cover fewer seasons. Cells where
+    H was in the set but all its features were dropped (``h_dropped``) are excluded. ``seasons``
+    gives that range (``first-last``, ``n`` seasons for "ALL")."""
     p = preds[(preds["scheme"] == scheme)].dropna(subset=["pred", "actual"])
+    if "h_dropped" in p:
+        # a set with H whose H features were all dropped is just the model without H (d = 0
+        # by construction): not an H observation, so it is left out of the pair
+        has_h = p["set"].str.split("+").apply(lambda g: "H" in g)
+        p = p[~(has_h & p["h_dropped"].fillna(False).astype(bool))]
     p = p.assign(se=(p["pred"] - p["actual"]) ** 2)
+    present = set(p["set"])
     out = []
     for a, b in pairs:
+        if a not in present or b not in present:
+            continue
         w = p[p["set"].isin([a, b])].pivot_table(index=["snapshot", "season"], columns="set",
                                                  values="se").dropna()
         if w.empty:
@@ -389,8 +436,11 @@ def paired_comparison(preds: pd.DataFrame, pairs=(("W+C", "W+C+S"), ("W", "W+S")
                         "rmse_base": float(np.sqrt(g[a].mean())),
                         "rmse_with_s": float(np.sqrt(g[b].mean())),
                         "mean_d_se": float(dd.mean()), "n_s_better": int((dd > 0).sum()),
-                        "p_ttest": t_p, "p_wilcoxon": w_p})
+                        "p_ttest": t_p, "p_wilcoxon": w_p,
+                        "seasons": f"{g.index.min()}-{g.index.max()}"})
     df = pd.DataFrame(out)
+    if df.empty:
+        return df
     order = {k: i for i, k in enumerate([*SNAPSHOTS, "ALL"])}
-    return df.sort_values(["base", "snapshot"], key=lambda c: c.map(order) if c.name == "snapshot"
+    return df.sort_values(["base", "with_s", "snapshot"], key=lambda c: c.map(order) if c.name == "snapshot"
                           else c).reset_index(drop=True)
