@@ -47,11 +47,25 @@ US satellite/weather features = fixed-weight mean of the state features
 over the states with a non-NaN value for that feature on that date (``us_weights``).
 US z-scores are therefore weighted means of state z-scores. US USDA features use the
 NASS national series (geo "US") directly. US ``*_asof`` = max of the state values.
+
+Satellite sources (``SatSpec``)
+-------------------------------
+MODIS and NASA HLS (30 m, ``hls_state.parquet``) go through the same recipe
+(``prepare_sat`` / ``_sat_state``); a ``SatSpec`` carries what differs. ``MODIS_SPEC``
+keeps the historical unprefixed names (ndvi, ..., modis_asof, modis_coverage,
+us_n_states_modis). ``HLS_SPEC`` prefixes every column with ``hls_`` (hls_ndvi, ...,
+hls_asof, hls_coverage, us_n_states_hls); HLS columns are appended AFTER all other
+columns, so a build without HLS (``hls=None``) is bit-identical to the MODIS-only panel.
+HLS composites end every 4 days over a 16-day trailing window (they overlap): available
+= ``end_date + HLS_LAG_DAYS`` (7 d), stale after ``HLS_MAX_STALENESS_DAYS`` (21 d) from
+the composite's end_date, climatology from HLS_CLIM_FIRST_YEAR (2013) .. Y-1 with the
+2013-2015 pre-sample (``hls_state_presample.parquet``) feeding only the climatology.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date
 
 import numpy as np
@@ -64,11 +78,18 @@ log = logging.getLogger(__name__)
 
 MODIS_LAG_DAYS = 14
 MAX_STALENESS_DAYS = 30  # MODIS: NaN when (date - end_date of latest composite) > this
+# HLS (30 m, 4-day cadence of 16-day trailing composites). The lag is provisional (to be
+# re-measured from real HLS ingestion latency); staleness tolerates ~3 missed composites.
+HLS_LAG_DAYS = 7
+HLS_MAX_STALENESS_DAYS = 21
+HLS_MIN_VALID_FRAC = 0.5
+HLS_CLIM_FIRST_YEAR = 2013  # Landsat-8 L30 starts in 2013; S30 from late 2015
 # NaN when the newest weather day is older than this: the normal lag (WEATHER_LAG_DAYS) plus
 # 6 days of tolerated outage (the same 6 days of slack the former 1-day-lag / 7 d rule gave).
 WEATHER_MAX_STALENESS_DAYS = WEATHER_LAG_DAYS + 6
 USDA_MAX_STALENESS_DAYS = 14  # NaN when the newest NASS week_ending is older than this
-US_ONLY_COLS = ("us_n_states_modis", "us_n_states_weather")  # defined on US rows only
+# defined on US rows only (not copied per state into the trading table)
+US_ONLY_COLS = ("us_n_states_modis", "us_n_states_weather", "us_n_states_hls")
 MIN_VALID_FRAC = 0.5
 CLIM_FIRST_YEAR = 2003
 MIN_CLIM_YEARS = 3
@@ -84,13 +105,91 @@ DOY_GRID = np.arange(1, 366)
 
 FEATURES_DAILY_PATH = DATA_PROCESSED / "features_daily.parquet"
 FEATURES_TRADING_PATH = DATA_PROCESSED / "features_trading.parquet"
+HLS_STATE_PATH = DATA_PROCESSED / "hls_state.parquet"
+HLS_PRESAMPLE_PATH = DATA_PROCESSED / "hls_state_presample.parquet"
 
-MODIS_COLS = [
-    "modis_age_days", "ndvi", "evi", "ndvi_anom", "evi_anom", "ndvi_z", "evi_z",
-    "ndvi_anom_cum", "evi_anom_cum", "ndvi_trend_anom", "evi_trend_anom",
-    "ndvi_cummax_anom", "modis_clim_n",
+# value features of every satellite source, unprefixed (MODIS keeps exactly these names)
+SAT_VALUE_BASE = [
+    "ndvi", "evi", "ndvi_anom", "evi_anom", "ndvi_z", "evi_z", "ndvi_anom_cum",
+    "evi_anom_cum", "ndvi_trend_anom", "evi_trend_anom", "ndvi_cummax_anom",
 ]  # fmt: skip
-MODIS_VALUE_COLS = [c for c in MODIS_COLS if c not in ("modis_age_days", "modis_clim_n")]
+
+
+@dataclass(frozen=True)
+class SatSpec:
+    """One satellite source of the panel: column naming and timing rules.
+
+    ``name`` names the meta columns (``<name>_age_days``, ``<name>_clim_n``,
+    ``<name>_asof``, ``<name>_coverage``, ``us_n_states_<name>``); ``prefix`` is put in
+    front of the value columns (``SAT_VALUE_BASE``). A composite is available on
+    ``end_date + lag_days``; values are NaN when ``date - end_date`` of the composite used
+    exceeds ``max_staleness_days``; composites with ``valid_frac < min_valid_frac`` are
+    dropped; the climatology uses seasons ``clim_first_year`` .. Y-1 with at least
+    ``min_clim_years`` per DOY. ``has_good_cols`` records whether the input carries
+    QA-good-only ``*_mean_good`` columns (MODIS); the features use ``*_mean`` either way.
+    """
+
+    name: str
+    prefix: str
+    lag_days: int
+    max_staleness_days: int
+    min_valid_frac: float
+    clim_first_year: int
+    has_good_cols: bool
+    min_clim_years: int = MIN_CLIM_YEARS
+    trend_lag_days: int = TREND_LAG_DAYS
+    trend_tol_days: int = TREND_TOL_DAYS
+
+    @property
+    def value_cols(self) -> list[str]:
+        return [self.prefix + c for c in SAT_VALUE_BASE]
+
+    @property
+    def age_col(self) -> str:
+        return f"{self.name}_age_days"
+
+    @property
+    def clim_n_col(self) -> str:
+        return f"{self.name}_clim_n"
+
+    @property
+    def asof_col(self) -> str:
+        return f"{self.name}_asof"
+
+    @property
+    def coverage_col(self) -> str:
+        return f"{self.name}_coverage"
+
+    @property
+    def n_states_col(self) -> str:
+        return f"us_n_states_{self.name}"
+
+    @property
+    def anom_col(self) -> str:
+        """Column that defines coverage / n_states (a state "has" the source that day)."""
+        return f"{self.prefix}ndvi_anom"
+
+    @property
+    def cols(self) -> list[str]:
+        """Per-state numeric columns (also US-aggregated by weighted mean)."""
+        return [self.age_col, *self.value_cols, self.clim_n_col]
+
+    @property
+    def block_cols(self) -> list[str]:
+        """Every panel column this source produces, in the order an appended block uses."""
+        return [self.asof_col, *self.cols, self.coverage_col, self.n_states_col]
+
+
+MODIS_SPEC = SatSpec("modis", "", MODIS_LAG_DAYS, MAX_STALENESS_DAYS, MIN_VALID_FRAC,
+                     CLIM_FIRST_YEAR, has_good_cols=True)
+HLS_SPEC = SatSpec("hls", "hls_", HLS_LAG_DAYS, HLS_MAX_STALENESS_DAYS, HLS_MIN_VALID_FRAC,
+                   HLS_CLIM_FIRST_YEAR, has_good_cols=False)
+SAT_SPECS = (MODIS_SPEC, HLS_SPEC)
+
+MODIS_COLS = MODIS_SPEC.cols
+MODIS_VALUE_COLS = MODIS_SPEC.value_cols
+HLS_COLS = HLS_SPEC.cols
+HLS_VALUE_COLS = HLS_SPEC.value_cols
 WEATHER_COLS = [
     "gdd_cum", "gdd_cum_anom", "precip_cum", "precip_cum_anom", "precip_30d",
     "precip_30d_anom", "edd30_cum", "edd30_jul", "edd30_14d",
@@ -167,24 +266,41 @@ def climatology_years(curves: pd.DataFrame, season: int,
 
 
 # --- input preparation --------------------------------------------------------------
+def sat_available_date(df: pd.DataFrame, spec: SatSpec) -> pd.Series:
+    """Availability used by the panel: end_date + spec.lag_days (overrides any stored
+    available_date). For overlapping HLS composites each composite has its own end_date, so
+    the composite ending E is usable from E + lag even though later composites share part
+    of its window (they become usable only from their own, later, end_date + lag)."""
+    return _dt(df["end_date"]) + pd.Timedelta(days=spec.lag_days)
+
+
 def modis_available_date(df: pd.DataFrame) -> pd.Series:
     """Availability used by Phase 5: end_date + MODIS_LAG_DAYS (overrides stored value)."""
-    return _dt(df["end_date"]) + pd.Timedelta(days=MODIS_LAG_DAYS)
+    return sat_available_date(df, MODIS_SPEC)
 
 
-def prepare_modis(modis: pd.DataFrame) -> pd.DataFrame:
-    """Valid composites with Phase-5 availability, observation time ``t`` (obs_date, or
-    mid_date if missing), ``season`` and ``doy``. Terra and Aqua are merged into one
-    series per state (8-day cadence) simply by pooling and ordering on ``t``."""
-    df = modis[modis["valid_frac"] >= MIN_VALID_FRAC].copy()
+def prepare_sat(sat: pd.DataFrame, spec: SatSpec) -> pd.DataFrame:
+    """Valid composites with panel availability, observation time ``t`` (obs_date, or
+    mid_date if missing), ``season``, ``doy`` and a boolean ``presample`` (False when the
+    column is absent). Several platforms (MODIS Terra + Aqua, 8-day cadence; HLS is a
+    single harmonised L30+S30 series) are merged into one series per state simply by
+    pooling and ordering on ``t``."""
+    df = sat[sat["valid_frac"] >= spec.min_valid_frac].copy()
     for c in ["start_date", "end_date", "mid_date", "obs_date"]:
         df[c] = _dt(df[c])
-    df["available_date"] = modis_available_date(df)
+    df["available_date"] = sat_available_date(df, spec)
     df["t"] = df["obs_date"].fillna(df["mid_date"])
     df["season"] = df["year"].astype(int)
     df["doy"] = cal_doy(df["t"])
+    df["presample"] = (df["presample"].fillna(False).astype(bool) if "presample" in df
+                       else False)
     df = df.dropna(subset=["ndvi_mean", "evi_mean"])
     return df.sort_values(["state", "available_date", "t"]).reset_index(drop=True)
+
+
+def prepare_modis(modis: pd.DataFrame) -> pd.DataFrame:
+    """``prepare_sat`` with ``MODIS_SPEC`` (Terra + Aqua pooled, 8-day cadence)."""
+    return prepare_sat(modis, MODIS_SPEC)
 
 
 def prepare_weather(weather: pd.DataFrame) -> pd.DataFrame:
@@ -242,21 +358,42 @@ def prepare_usda(usda: dict | None) -> dict | None:
     return out or None
 
 
-# --- MODIS --------------------------------------------------------------------------
-def _modis_state(comps: pd.DataFrame, seasons) -> pd.DataFrame:
-    """Daily MODIS features for one state (comps = prepared rows of that state)."""
+# --- satellite (MODIS, HLS) ---------------------------------------------------------
+def _sat_state(comps: pd.DataFrame, seasons, spec: SatSpec) -> pd.DataFrame:
+    """Daily features of one satellite source for one state (comps = ``prepare_sat`` rows
+    of that state), columns ``[*spec.cols, spec.asof_col]``.
+
+    No look-ahead, also with overlapping composites (HLS: 16-day windows every 4 days):
+    * Row d uses only composites with ``available_date = end_date + lag <= d``: the season's
+      composites are ordered by availability, features are computed once per available
+      prefix and row d takes the prefix ``searchsorted(avail, d, "right")``.
+    * Values come from the composite with the latest observation time ``t`` in that
+      prefix; staleness (``<name>_age_days``) is measured from that composite's end_date,
+      the last day its window can contain.
+    * The trend partner is the composite of the SAME prefix whose ``t`` is nearest to
+      t_latest - trend_lag_days (16 d; within trend_tol_days), so it was already available.
+      For HLS at a 4-day cadence that is normally the composite ending 16 days earlier,
+      whose window does not overlap the latest one.
+    * The climatology uses seasons clim_first_year .. Y-1 only (all available before the
+      Apr 1 start of season Y). ``presample`` rows enter the climatology curves but never
+      the features of their own season (pre-sample seasons give NaN rows).
+    * ``*_anom_cum`` averages overlapping composites (each day counted in up to 4 HLS
+      composites): a smoothing, not a look-ahead.
+    """
     curves = {v: season_curves(comps, f"{v}_mean") for v in ("ndvi", "evi")}
     apr1_doy = int(cal_doy([pd.Timestamp(2001, *SEASON_START)])[0])
+    own = ~comps["presample"].to_numpy(bool) if "presample" in comps else True
     frames = []
     for y in seasons:
         days = season_days(y)
-        out = pd.DataFrame(index=days, columns=[*MODIS_COLS, "modis_asof"], dtype="float64")
-        out["modis_asof"] = pd.NaT
-        cs = comps[comps["season"] == y].sort_values(["available_date", "t"])
+        out = pd.DataFrame(index=days, columns=[*spec.cols, spec.asof_col], dtype="float64")
+        out[spec.asof_col] = pd.NaT
+        cs = comps[(comps["season"] == y) & own].sort_values(["available_date", "t"])
         if cs.empty:
             frames.append(out)
             continue
-        clim = {v: climatology(curves[v], y) for v in ("ndvi", "evi")}
+        clim = {v: climatology(curves[v], y, spec.clim_first_year, spec.min_clim_years)
+                for v in ("ndvi", "evi")}
         doy = cs["doy"].to_numpy()
         val = {v: cs[f"{v}_mean"].to_numpy(float) for v in ("ndvi", "evi")}
         anom = {v: val[v] - clim[v]["mean"].reindex(doy).to_numpy() for v in val}
@@ -281,10 +418,10 @@ def _modis_state(comps: pd.DataFrame, seasons) -> pd.DataFrame:
                 m = tt >= cum_start
                 r[f"{v}_anom_cum"] = np.nanmean(anom[v][:k][m]) if np.isfinite(
                     anom[v][:k][m]).any() else np.nan
-            target = tt[li] - np.timedelta64(TREND_LAG_DAYS, "D")
+            target = tt[li] - np.timedelta64(spec.trend_lag_days, "D")
             dist = np.abs((tt - target).astype(int)).astype(float)
             dist[li] = np.inf
-            dist[dist > TREND_TOL_DAYS] = np.inf
+            dist[dist > spec.trend_tol_days] = np.inf
             if np.isfinite(dist).any():
                 pj = int(np.flatnonzero(dist == dist.min())[-1])
                 for v in ("ndvi", "evi"):
@@ -306,17 +443,22 @@ def _modis_state(comps: pd.DataFrame, seasons) -> pd.DataFrame:
         d_has = days[has]
         age = (d_has.to_numpy("datetime64[D]") - sel["end"].to_numpy("datetime64[D]")
                ).astype(int)
-        fresh = age <= MAX_STALENESS_DAYS
-        out.loc[d_has, "modis_age_days"] = age.astype(float)
-        out.loc[d_has, "modis_asof"] = pd.to_datetime(sel["asof"]).to_numpy()
-        out.loc[d_has, "modis_clim_n"] = sel["clim_n"].to_numpy(float)
-        for c in MODIS_VALUE_COLS:
-            out.loc[d_has, c] = np.where(fresh, sel[c].to_numpy(float), np.nan)
+        fresh = age <= spec.max_staleness_days
+        out.loc[d_has, spec.age_col] = age.astype(float)
+        out.loc[d_has, spec.asof_col] = pd.to_datetime(sel["asof"]).to_numpy()
+        out.loc[d_has, spec.clim_n_col] = sel["clim_n"].to_numpy(float)
+        for base, c in zip(SAT_VALUE_BASE, spec.value_cols):
+            out.loc[d_has, c] = np.where(fresh, sel[base].to_numpy(float), np.nan)
         frames.append(out)
     res = pd.concat(frames)
     res.index.name = "date"
-    res["modis_asof"] = pd.to_datetime(res["modis_asof"])
+    res[spec.asof_col] = pd.to_datetime(res[spec.asof_col])
     return res
+
+
+def _modis_state(comps: pd.DataFrame, seasons) -> pd.DataFrame:
+    """Daily MODIS features for one state (comps = prepared rows of that state)."""
+    return _sat_state(comps, seasons, MODIS_SPEC)
 
 
 # --- weather ------------------------------------------------------------------------
@@ -412,7 +554,11 @@ def _usda_geo(u: dict, geo: str, seasons) -> pd.DataFrame | None:
 
 # --- panel --------------------------------------------------------------------------
 def _us_aggregate(states_panel: pd.DataFrame, value_cols, asof_cols) -> pd.DataFrame:
-    """US rows = renormalised fixed-weight mean of state values (per date and column)."""
+    """US rows = renormalised fixed-weight mean of state values (per date and column).
+
+    For every satellite source present in ``states_panel`` (its ``anom_col`` is a column)
+    adds ``<name>_coverage`` (weight share of states with that anomaly) and then
+    ``us_n_states_<name>``; ``us_n_states_weather`` when weather is present."""
     p = states_panel
     w = p["geo"].map(US_WEIGHTS).astype(float)
     out = {}
@@ -425,35 +571,74 @@ def _us_aggregate(states_panel: pd.DataFrame, value_cols, asof_cols) -> pd.DataF
     for c in asof_cols:
         out[c] = p.groupby("date")[c].max()
     res = pd.DataFrame(out)
-    res["modis_coverage"] = (w.where(p["ndvi_anom"].notna(), 0.0)
-                             .groupby(p["date"]).sum() / sum(US_WEIGHTS.values()))
+    specs = [s for s in SAT_SPECS if s.anom_col in p]
+    for s in specs:
+        res[s.coverage_col] = (w.where(p[s.anom_col].notna(), 0.0)
+                               .groupby(p["date"]).sum() / sum(US_WEIGHTS.values()))
     # number of states entering the aggregate (renormalised weights: fewer than 5 means the
-    # aggregate is a sub-national mean); MODIS counted on ndvi_anom, weather on gdd_cum_anom
-    res["us_n_states_modis"] = p["ndvi_anom"].notna().groupby(p["date"]).sum().astype(int)
-    res["us_n_states_weather"] = p["gdd_cum_anom"].notna().groupby(p["date"]).sum().astype(int)
+    # aggregate is a sub-national mean); satellite counted on its ndvi_anom, weather on
+    # gdd_cum_anom
+    for s in specs:
+        res[s.n_states_col] = p[s.anom_col].notna().groupby(p["date"]).sum().astype(int)
+    if "gdd_cum_anom" in p:
+        res["us_n_states_weather"] = (p["gdd_cum_anom"].notna().groupby(p["date"]).sum()
+                                      .astype(int))
     return res.reset_index()
 
 
+def _sat_block(prepared: pd.DataFrame, seasons, spec: SatSpec) -> pd.DataFrame:
+    """Long (geo, date) frame of one satellite source for the states and the US, columns
+    ``["geo", "date", *spec.block_cols]`` (state coverage = 1/0, US-only n_states NaN on
+    state rows), built exactly like the MODIS part of the panel."""
+    parts = []
+    for st in STATES:
+        f = _sat_state(prepared[prepared["state"] == st], seasons, spec)
+        f.insert(0, "geo", st)
+        parts.append(f.reset_index())
+    states_panel = pd.concat(parts, ignore_index=True)
+    us = _us_aggregate(states_panel, spec.cols, [spec.asof_col])
+    us.insert(0, "geo", "US")
+    blk = pd.concat([states_panel, us], ignore_index=True)
+    st_rows = blk["geo"] != "US"
+    blk.loc[st_rows, spec.coverage_col] = np.where(
+        blk.loc[st_rows, spec.anom_col].notna(), 1.0, 0.0)
+    return blk[["geo", "date", *spec.block_cols]]
+
+
+def _append_sat(panel: pd.DataFrame, sat: pd.DataFrame, seasons, spec: SatSpec
+                ) -> pd.DataFrame:
+    """``panel`` with the block of ``spec`` appended as its LAST columns, aligned on
+    (geo, date). Existing columns are not touched."""
+    blk = _sat_block(prepare_sat(sat, spec), seasons, spec).set_index(["geo", "date"])
+    key = pd.MultiIndex.from_arrays([panel["geo"], panel["date"]])
+    blk = blk.reindex(key)
+    add = pd.DataFrame({c: blk[c].to_numpy() for c in spec.block_cols}, index=panel.index)
+    return pd.concat([panel, add], axis=1)
+
+
 def build_features(modis: pd.DataFrame, weather: pd.DataFrame, usda: dict | None = None,
-                   seasons=None) -> pd.DataFrame:
+                   seasons=None, hls: pd.DataFrame | None = None) -> pd.DataFrame:
     """Daily as-of panel (long; see module doc) from PRE-LOADED input frames.
 
     ``modis``: modis_state rows (sample and pre-sample seasons concatenated; the stored
     available_date is ignored and replaced by end_date + MODIS_LAG_DAYS). ``weather``:
     weather_daily rows (sample + pre-sample). ``usda``: optional dict with
     ``condition`` / ``progress`` frames as produced by ``usda.parse_*``. ``seasons``:
-    output seasons (default config.YEARS). Every input row is used only on dates >= its
+    output seasons (default config.YEARS). ``hls``: optional hls_state rows (sample +
+    pre-sample flagged ``presample=True``; available = end_date + HLS_LAG_DAYS); its
+    ``HLS_SPEC.block_cols`` are appended after every other column, so ``hls=None`` gives
+    exactly the MODIS-only panel. Every input row is used only on dates >= its
     availability date, so passing frames truncated at date d yields identical values
     for all rows dated <= d (the truncation test relies on this).
     """
     seasons = list(YEARS if seasons is None else seasons)
-    mp = prepare_modis(modis)
+    mp = prepare_sat(modis, MODIS_SPEC)
     wp = prepare_weather(weather)
     up = prepare_usda(usda)
 
     parts = []
     for st in STATES:
-        f_m = _modis_state(mp[mp["state"] == st], seasons)
+        f_m = _sat_state(mp[mp["state"] == st], seasons, MODIS_SPEC)
         f_w = _weather_state(wp[wp["state"] == st], seasons)
         f = f_m.join(f_w, how="outer")
         f.insert(0, "geo", st)
@@ -487,6 +672,8 @@ def build_features(modis: pd.DataFrame, weather: pd.DataFrame, usda: dict | None
     panel["geo"] = pd.Categorical(panel["geo"], categories=GEOS)
     panel = panel.sort_values(["geo", "date"]).reset_index(drop=True)
     panel["geo"] = panel["geo"].astype(str)
+    if hls is not None:
+        panel = _append_sat(panel, hls, seasons, HLS_SPEC)
     return panel
 
 
@@ -501,9 +688,32 @@ def load_usda_tables() -> dict | None:
     return out or None
 
 
-def load_inputs(presample: bool = True) -> dict:
+def load_hls(presample: bool = True) -> pd.DataFrame | None:
+    """hls_state rows (``presample=False``) plus, if ``presample`` and the file exists,
+    the 2013-2015 pre-sample rows (``presample=True``: climatology only). Pre-sample
+    seasons that are also in the sample are dropped (the sample wins). None when
+    hls_state.parquet does not exist."""
+    if not HLS_STATE_PATH.exists():
+        return None
+    h = pd.read_parquet(HLS_STATE_PATH).assign(presample=False)
+    if presample:
+        if HLS_PRESAMPLE_PATH.exists():
+            hp = pd.read_parquet(HLS_PRESAMPLE_PATH)
+            dup = hp["year"].isin(set(h["year"]))
+            if dup.any():
+                log.warning("HLS pre-sample seasons %s also in the sample; using the sample",
+                            sorted(set(hp.loc[dup, "year"])))
+            h = pd.concat([hp[~dup].assign(presample=True), h], ignore_index=True)
+        else:
+            log.warning("no HLS pre-sample; HLS climatology needs %d sample seasons",
+                        MIN_CLIM_YEARS)
+    return h
+
+
+def load_inputs(presample: bool = True, hls: bool = True) -> dict:
     """Pre-loaded inputs for ``build_features``: modis (with ``presample`` flag column),
-    weather (sample + pre-sample) and usda (dict or None)."""
+    weather (sample + pre-sample), usda (dict or None) and hls (``load_hls``; None when
+    absent or ``hls`` is False)."""
     from cornsat import modis as modis_mod
     from cornsat import weather as weather_mod
 
@@ -521,31 +731,42 @@ def load_inputs(presample: bool = True) -> dict:
             w = pd.concat([wp, w], ignore_index=True)
         else:
             log.warning("no weather pre-sample; climatology falls back to expanding window")
-    return {"modis": m, "weather": w, "usda": load_usda_tables()}
+    return {"modis": m, "weather": w, "usda": load_usda_tables(),
+            "hls": load_hls(presample) if hls else None}
 
 
 def build_trading(panel: pd.DataFrame, zcz: pd.DataFrame) -> pd.DataFrame:
     """US features (unsuffixed) plus every state's features (suffix ``_<state>``, lower
     case) joined onto front-December ZCZ trading dates that fall in the season window of
     their own campaign (Apr 1 - Oct 31 of year == campaign). Features on row d are as of
-    d (see module doc)."""
+    d (see module doc). The columns of an appended satellite block (HLS) come last, US
+    then states, so the table without HLS is exactly the MODIS-only table."""
     z = zcz[["date", "contract", "campaign", "close", "ret", "days_to_expiry"]].copy()
     z["date"] = _dt(z["date"])
     z = z[z["campaign"] == z["date"].dt.year]
     feat_cols = [c for c in panel.columns if c not in ("geo", "date", "season", "doy")]
-    us = panel[panel["geo"] == "US"][["date", *feat_cols]]
-    out = z.merge(us, on="date", how="inner")
-    st_cols = [c for c in feat_cols if c not in US_ONLY_COLS]
-    for st in STATES:
-        s = panel[panel["geo"] == st][["date", *st_cols]]
-        s = s.rename(columns={c: f"{c}_{st.lower()}" for c in st_cols})
-        out = out.merge(s, on="date", how="left")
+    appended = [s.block_cols for s in SAT_SPECS if s is not MODIS_SPEC]
+    in_blocks = {c for b in appended for c in b}
+    groups = [[c for c in feat_cols if c not in in_blocks],
+              *[[c for c in feat_cols if c in b] for b in appended]]
+    out = z
+    for i, cols in enumerate(groups):
+        if i and not cols:
+            continue
+        us = panel[panel["geo"] == "US"][["date", *cols]]
+        out = out.merge(us, on="date", how="inner" if i == 0 else "left")
+        st_cols = [c for c in cols if c not in US_ONLY_COLS]
+        for st in STATES:
+            s = panel[panel["geo"] == st][["date", *st_cols]]
+            s = s.rename(columns={c: f"{c}_{st.lower()}" for c in st_cols})
+            out = out.merge(s, on="date", how="left")
     return out.sort_values("date").reset_index(drop=True)
 
 
-def build_and_save(presample: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-    inp = load_inputs(presample)
-    panel = build_features(inp["modis"], inp["weather"], inp["usda"])
+def build_and_save(presample: bool = True, hls: bool = True
+                   ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    inp = load_inputs(presample, hls=hls)
+    panel = build_features(inp["modis"], inp["weather"], inp["usda"], hls=inp["hls"])
     zcz = pd.read_parquet(DATA_PROCESSED / "zcz_front_dec.parquet")
     trading = build_trading(panel, zcz)
     FEATURES_DAILY_PATH.parent.mkdir(parents=True, exist_ok=True)
