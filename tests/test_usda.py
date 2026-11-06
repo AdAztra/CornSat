@@ -58,13 +58,57 @@ def test_progress_fixture():
     assert p.available_date[0] == pd.Timestamp("2012-09-05")  # Labor Day 2012-09-03
 
 
-def test_yield_fixture():
+def test_yield_fixture(monkeypatch):
+    monkeypatch.setattr(usda, "today", lambda: pd.Timestamp("2026-11-06"))
     y = usda.parse_yield(load("usda_yield.json"))
     assert set(y.period) == {"AUG", "SEP", "FINAL"}  # INTENTIONS row ignored
     f = y[y.period == "FINAL"].iloc[0]
     assert f.yield_bu_ac == 123.1 and f.production_bu == 10780296000
     assert f.available_date == usda.final_yield_available_date(2012)
+    # AUG load_time Fri 2012-08-10 -> Mon 08-13
+    assert y[y.period == "AUG"].iloc[0].available_date == pd.Timestamp("2012-08-13")
+    # SEP load_time Tue 2012-09-11 -> Wed 09-12
+    assert y[y.period == "SEP"].iloc[0].available_date == pd.Timestamp("2012-09-12")
+
+
+def test_next_business_day_after():
+    assert usda.next_business_day_after("2012-08-10 12:59:15") == pd.Timestamp("2012-08-13")  # Fri
+    # Fri 2024-05-24 load, Memorial Day Mon 05-27 -> Tue 05-28
+    assert usda.next_business_day_after("2024-05-24") == pd.Timestamp("2024-05-28")
+
+
+def test_forecast_load_time_cases():
+    # 2026 AUG: rule says 08-11 (look-ahead); load_time 08-12 -> Thu 08-13
+    assert usda.crop_production_release_date(2026, 8) == pd.Timestamp("2026-08-11")
+    assert usda.forecast_available_date(2026, 8, ["2026-08-12 12:00:00.000"]) == pd.Timestamp("2026-08-13")
+    # holiday: load Tue 2020-11-10, Veterans Day Wed 11-11 -> Thu 11-12
+    assert usda.forecast_available_date(2020, 11, ["2020-11-10 12:00:00"]) == pd.Timestamp("2020-11-12")
+    # max over several load_times
+    assert usda.forecast_available_date(
+        2012, 8, ["2012-08-10 12:59:15", "2012-08-14 09:00:00"]) == pd.Timestamp("2012-08-15")
+    # fallback: missing, unparsable, or wrong month
+    rule = usda.crop_production_release_date(2012, 8)
+    for lt in (None, [None], ["garbage"], ["2012-09-10 12:00:00"]):
+        assert usda.forecast_available_date(2012, 8, lt) == rule
+
+
+def test_yield_rule_fallback_without_load_time(monkeypatch):
+    monkeypatch.setattr(usda, "today", lambda: pd.Timestamp("2026-11-06"))
+    raw = load("usda_yield.json").drop(columns=["load_time"])
+    y = usda.parse_yield(raw)
     assert y[y.period == "AUG"].iloc[0].available_date == usda.crop_production_release_date(2012, 8)
+
+
+def test_final_future_dropped(monkeypatch):
+    raw = load("usda_yield.json")
+    monkeypatch.setattr(usda, "today", lambda: pd.Timestamp("2013-01-10"))  # day before 2013-01-11
+    assert usda.final_yield_available_date(2012) == pd.Timestamp("2013-01-11")
+    assert "FINAL" not in set(usda.parse_yield(raw).period)
+    monkeypatch.setattr(usda, "today", lambda: pd.Timestamp("2013-01-11"))
+    assert "FINAL" in set(usda.parse_yield(raw).period)
+    # current calendar year is always dropped
+    monkeypatch.setattr(usda, "today", lambda: pd.Timestamp("2012-12-31"))
+    assert "FINAL" not in set(usda.parse_yield(raw).period)
 
 
 def test_missing_key(monkeypatch):
