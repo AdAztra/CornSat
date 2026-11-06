@@ -80,10 +80,9 @@ def test_sep30_tuesday_rebalance_dropped():
 def test_signal_rules():
     np.testing.assert_array_equal(B.level_position([5, -5, 1, np.nan, -2.5], 2.0),
                                   [-1, 1, 0, 0, 1])
-    pred = pd.Series([1.0, 2.0, 1.9, 0.0, 3.0, 3.1])
-    season = pd.Series([2020, 2020, 2020, 2020, 2021, 2021])
-    # delta: nan, +1, -0.1, -1.9 | nan, +0.1 -> short, flat, long | flat, flat
-    np.testing.assert_array_equal(B.change_position(pred, season, 0.5), [0, -1, 0, 1, 0, 0])
+    # same-model delta: nan (first rebalance), +1, -0.1, -1.9 | nan, +0.1 -> flat, short, flat, long | flat, flat
+    delta = np.array([np.nan, 1.0, -0.1, -1.9, np.nan, 0.1])
+    np.testing.assert_array_equal(B.change_position(delta, 0.5), [0, -1, 0, 1, 0, 0])
     np.testing.assert_array_equal(B.vs_usda_position([5, 5, -1], [np.nan, 1, 4], 2.0),
                                   [0, -1, 1])
 
@@ -145,3 +144,67 @@ def test_random_sign_and_bootstrap_shapes():
     bs = B.block_bootstrap(w, n_boot=500, seed=0, other=w)
     assert bs["pnl_lo"] <= bs["pnl_hi"] and bs["sharpe_lo"] <= bs["sharpe_hi"]
     assert bs["diff"] == 0 and bs["diff_lo"] == 0 and bs["diff_hi"] == 0
+
+
+# --- change rule: same-model delta, no churn ---------------------------------------------------
+def _flat_features(season=2016, seasons=range(2009, 2017)):
+    """synth_features, but the rows of ``season`` from Jun 1 are IDENTICAL (features at every
+    rebalance equal). Earlier seasons keep their within-season variation, so the ridge
+    refit at each rebalance (training rows at that date's day of season) differs."""
+    raw, tg = synth_features(seasons=seasons)
+    feat = raw.copy()
+    cols = [c for c in feat.columns if c not in ("date", "campaign", "contract", "close")]
+    m = (feat["campaign"] == season) & (feat["date"] >= f"{season}-06-01")
+    feat.loc[m, cols] = feat.loc[m, cols].iloc[0].to_numpy()
+    return feat, tg
+
+
+def test_pure_model_change_gives_zero_delta():
+    """Refits differ between rebalances (training rows are taken at each date's day of
+    season, so the ridge changes), but with identical features at both dates the
+    same-model delta is exactly 0 and the change rule trades nothing."""
+    raw, tg = _flat_features()
+    feat = M.prepare_features(raw)
+    dates = pd.DataFrame({"season": 2016,
+                          "date": pd.to_datetime(["2016-06-14", "2016-07-12", "2016-08-16"])})
+    p = M.rebalance_predictions(feat, tg, dates, sets=["W", "W+C"])
+    for s in ("W", "W+C"):
+        g = p[p["set"] == s].sort_values("date")
+        assert np.isnan(g["delta"].iloc[0])  # first rebalance of the season
+        np.testing.assert_allclose(g["delta"].iloc[1:], 0.0, atol=1e-12)
+        # the model (alpha / training rows) did change, so the OLD rule (diff of preds
+        # stored at consecutive rebalances) would see churn
+        assert g["pred"].diff().abs().iloc[1:].min() > 1e-6
+    sig, _ = B.compute_signals(feat, tg, pd.DataFrame(columns=["year", "available_date", "yield_bu_ac"]),
+                               dates, sets=["W"])
+    assert (B.change_position(sig["delta_W"], 0.0) == 0).all()
+
+
+def test_delta_uses_same_model_and_handles_missing_columns():
+    raw, tg = synth_features(seasons=range(2009, 2017))
+    feat = M.prepare_features(raw)
+    d0, d1 = pd.Timestamp("2016-07-05"), pd.Timestamp("2016-08-02")
+    dates = pd.DataFrame({"season": 2016, "date": [d0, d1]})
+    p = M.rebalance_predictions(feat, tg, dates, sets=["W"]).set_index("date")
+    by = feat.set_index("date")
+    # reference: fit at d1 and score both rows with that one model
+    with_t = M._with_targets(tg)
+    ax = M.AsofIndex(feat)
+    tX = ax.rows(M.training_pool("wf", 2016, with_t), int(by.loc[d1, "doy"]))
+    ty = tg.loc[tX.index, "surprise"]
+    cols = M.FEATURE_SETS["W"]
+    model = M.fit_ridge(tX[cols], ty)
+    ref = (model.predict(pd.DataFrame([by.loc[d1, cols].astype(float).to_numpy()], columns=cols))[0]
+           - model.predict(pd.DataFrame([by.loc[d0, cols].astype(float).to_numpy()], columns=cols))[0])
+    assert p.loc[d1, "delta"] == pytest.approx(ref)
+    assert p.loc[d1, "delta"] == pytest.approx(p.loc[d1, "pred"] - p.loc[d1, "pred_prev"])
+    # previous row lacks a column the model uses -> NaN delta -> flat
+    feat2 = feat.copy()
+    feat2.loc[feat2["date"] == d0, "edd30_cum"] = np.nan
+    p2 = M.rebalance_predictions(feat2, tg, dates, sets=["W"]).set_index("date")
+    assert np.isnan(p2.loc[d1, "delta"]) and p2.loc[d1, "used"] == p.loc[d1, "used"]
+    assert B.change_position(p2["delta"].to_numpy(), 0.5).tolist() == [0, 0]
+    # a new season restarts: its first rebalance has no previous row
+    d2 = pd.DataFrame({"season": [2015, 2016], "date": [pd.Timestamp("2015-08-04"), d0]})
+    p3 = M.rebalance_predictions(feat, tg, d2, sets=["W"])
+    assert p3["delta"].isna().all()

@@ -92,6 +92,26 @@ def test_forecast_load_time_cases():
         assert usda.forecast_available_date(2012, 8, lt) == rule
 
 
+def test_release_calendar_2009_2011():
+    """Bulk load_time (2012-01-01) is ignored; the calendar release day sets availability."""
+    cal = usda.RELEASE_CALENDAR
+    assert len(cal) == 12
+    assert cal[(2009, 8)] == pd.Timestamp("2009-08-12") and cal[(2011, 10)] == pd.Timestamp("2011-10-12")
+    bulk = ["2012-01-01 00:00:00"]
+    for (y, m), rel in cal.items():
+        got = usda.forecast_available_date(y, m, bulk)
+        assert got == max(usda.crop_production_release_date(y, m), usda.next_business_day_after(rel))
+        assert got > rel  # never usable on/before the real release day
+    # 2009 Aug: rule date (Aug 11) fell BEFORE the real release (Wed Aug 12) -> Thu Aug 13
+    assert usda.crop_production_release_date(2009, 8) == pd.Timestamp("2009-08-11")
+    assert usda.forecast_available_date(2009, 8, bulk) == pd.Timestamp("2009-08-13")
+    # 2010 Oct 8 is a Friday -> Monday Oct 11 (Columbus Day is a federal holiday -> Tue 12)
+    assert usda.forecast_available_date(2010, 10, bulk) >= pd.Timestamp("2010-10-11")
+    # a valid load_time later than the calendar still wins; years outside the calendar unchanged
+    assert usda.forecast_available_date(2010, 8, ["2010-08-16 12:00:00"]) == pd.Timestamp("2010-08-17")
+    assert usda.forecast_available_date(2012, 8, bulk) == usda.crop_production_release_date(2012, 8)
+
+
 def test_yield_rule_fallback_without_load_time(monkeypatch):
     monkeypatch.setattr(usda, "today", lambda: pd.Timestamp("2026-11-06"))
     raw = load("usda_yield.json").drop(columns=["load_time"])

@@ -7,15 +7,15 @@ from SEASON_START (Apr 1) to SEASON_END (Oct 31) of each season, geo in the 5 co
 plus ``"US"``. A value on row (geo, d) is computed only from input rows whose
 availability date is <= d; ``modis_asof`` / ``weather_asof`` / ``usda_asof`` give the
 newest availability date in the information set used for that row (always <= d).
-A row is "as of the morning of d": weather through d-1, a MODIS composite from
-``end_date + MODIS_LAG_DAYS``, a NASS Monday report from Tuesday (see ``usda``).
+A row is "as of the morning of d": weather through d-WEATHER_LAG_DAYS (3), a MODIS
+composite from ``end_date + MODIS_LAG_DAYS``, a NASS Monday report from Tuesday (see ``usda``).
 
 Availability rules (overriding anything stored upstream)
 ---------------------------------------------------------
 * MODIS: ``available = end_date + MODIS_LAG_DAYS`` (14 d; the stored 10 d is replaced
   because real latency was up to ~20 d for a few items). Composites with
   ``valid_frac < MIN_VALID_FRAC`` (0.5) are dropped.
-* Weather: ``available_date = date + 1`` (as stored).
+* Weather: ``available_date = date + WEATHER_LAG_DAYS`` (3 d, as stored by ``weather``).
 * USDA: ``available_date`` as stored by ``usda`` (Tuesday after the Sunday week end).
 
 Climatology (the "normal" each anomaly is measured against)
@@ -58,14 +58,17 @@ import numpy as np
 import pandas as pd
 
 from cornsat.config import DATA_PROCESSED, SEASON_END, SEASON_START, STATES, YEARS
-from cornsat.weather import US_WEIGHTS
+from cornsat.weather import US_WEIGHTS, WEATHER_LAG_DAYS
 
 log = logging.getLogger(__name__)
 
 MODIS_LAG_DAYS = 14
 MAX_STALENESS_DAYS = 30  # MODIS: NaN when (date - end_date of latest composite) > this
-WEATHER_MAX_STALENESS_DAYS = 7  # NaN when the newest weather day is older than this
+# NaN when the newest weather day is older than this: the normal lag (WEATHER_LAG_DAYS) plus
+# 6 days of tolerated outage (the same 6 days of slack the former 1-day-lag / 7 d rule gave).
+WEATHER_MAX_STALENESS_DAYS = WEATHER_LAG_DAYS + 6
 USDA_MAX_STALENESS_DAYS = 14  # NaN when the newest NASS week_ending is older than this
+US_ONLY_COLS = ("us_n_states_modis", "us_n_states_weather")  # defined on US rows only
 MIN_VALID_FRAC = 0.5
 CLIM_FIRST_YEAR = 2003
 MIN_CLIM_YEARS = 3
@@ -424,6 +427,10 @@ def _us_aggregate(states_panel: pd.DataFrame, value_cols, asof_cols) -> pd.DataF
     res = pd.DataFrame(out)
     res["modis_coverage"] = (w.where(p["ndvi_anom"].notna(), 0.0)
                              .groupby(p["date"]).sum() / sum(US_WEIGHTS.values()))
+    # number of states entering the aggregate (renormalised weights: fewer than 5 means the
+    # aggregate is a sub-national mean); MODIS counted on ndvi_anom, weather on gdd_cum_anom
+    res["us_n_states_modis"] = p["ndvi_anom"].notna().groupby(p["date"]).sum().astype(int)
+    res["us_n_states_weather"] = p["gdd_cum_anom"].notna().groupby(p["date"]).sum().astype(int)
     return res.reset_index()
 
 
@@ -528,9 +535,10 @@ def build_trading(panel: pd.DataFrame, zcz: pd.DataFrame) -> pd.DataFrame:
     feat_cols = [c for c in panel.columns if c not in ("geo", "date", "season", "doy")]
     us = panel[panel["geo"] == "US"][["date", *feat_cols]]
     out = z.merge(us, on="date", how="inner")
+    st_cols = [c for c in feat_cols if c not in US_ONLY_COLS]
     for st in STATES:
-        s = panel[panel["geo"] == st][["date", *feat_cols]]
-        s = s.rename(columns={c: f"{c}_{st.lower()}" for c in feat_cols})
+        s = panel[panel["geo"] == st][["date", *st_cols]]
+        s = s.rename(columns={c: f"{c}_{st.lower()}" for c in st_cols})
         out = out.merge(s, on="date", how="left")
     return out.sort_values("date").reset_index(drop=True)
 

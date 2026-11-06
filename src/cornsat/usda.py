@@ -158,10 +158,28 @@ def today() -> pd.Timestamp:
     return pd.Timestamp.today().normalize()
 
 
+# Crop Production report release days for 2009-2011, where NASS Quick Stats ``load_time`` is a
+# bulk load (2012-01-01) and cannot date the release. (year, month) -> release day.
+# TODO verify: entered FROM MEMORY, not checked against the NASS Crop Production archive.
+RELEASE_CALENDAR: dict[tuple[int, int], pd.Timestamp] = {
+    (y, m): pd.Timestamp(y, m, d)
+    for y, days in {
+        2009: {8: 12, 9: 11, 10: 9, 11: 10},
+        2010: {8: 12, 9: 10, 10: 8, 11: 9},
+        2011: {8: 11, 9: 12, 10: 12, 11: 9},
+    }.items()
+    for m, d in days.items()
+}
+
+
 def forecast_available_date(year: int, month: int, load_times=None) -> pd.Timestamp:
-    """Forecast usable date: next business day after the (max) load_time date when it
-    parses and lies in the forecast's year/month; never earlier than the rule date."""
+    """Forecast usable date = max of (rule date, next business day after the
+    RELEASE_CALENDAR day when listed, next business day after the (max) load_time date when
+    it parses and lies in the forecast's year/month)."""
     rule = crop_production_release_date(year, month)
+    cal = RELEASE_CALENDAR.get((year, month))
+    if cal is not None:
+        rule = max(rule, next_business_day_after(cal))
     lt = pd.to_datetime(pd.Series([] if load_times is None else list(load_times)),
                         errors="coerce").dropna()
     lt = lt[(lt.dt.year == year) & (lt.dt.month == month)]

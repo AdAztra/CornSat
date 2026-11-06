@@ -72,6 +72,10 @@ GDD_BASE = 10.0
 GDD_CAP = 30.0
 EDD_THRESHOLD = 30.0
 
+# NASA POWER publishes daily data with a ~3 day lag (on 2026-11-06 the series ended on
+# 2026-11-03), so the value for day D is only usable from D + WEATHER_LAG_DAYS.
+WEATHER_LAG_DAYS = 3
+
 
 def fetch_point(lat: float, lon: float, force: bool = False, retries: int = 5,
                 start: str = START, end: str | None = None) -> pd.DataFrame:
@@ -162,7 +166,7 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df["precip_30d"] = df["precip_mm"].rolling(30, min_periods=30).sum()
     p = df["precip_mm"].where(in_season)
     df["precip_cum"] = p.groupby(yr).cumsum().where(in_season)
-    df["available_date"] = df["date"] + pd.Timedelta(days=1)
+    df["available_date"] = df["date"] + pd.Timedelta(days=WEATHER_LAG_DAYS)
     return df
 
 

@@ -372,7 +372,7 @@ def test_weather_definitions(syn_inputs, syn_panel):
     ia = w[w["state"] == "IA"].set_index("date")
     g = syn_panel[syn_panel["geo"] == "IA"].set_index("date")
     d = pd.Timestamp("2011-07-20")
-    last = d - pd.Timedelta(days=1)
+    last = d - pd.Timedelta(days=weather.WEATHER_LAG_DAYS)  # newest weather day at d is d-3
     assert g.loc[d, "weather_asof"] == d
     assert g.loc[d, "edd30_jul"] == pytest.approx(ia.loc["2011-07-01":last, "edd30"].sum())
     assert g.loc[d, "edd30_14d"] == pytest.approx(
@@ -384,6 +384,58 @@ def test_weather_definitions(syn_inputs, syn_panel):
     assert g.loc[d, "gdd_cum_anom"] == pytest.approx(ia.loc[last, "gdd_cum"] - np.mean(prior))
     aug = pd.Timestamp("2011-08-20")
     assert g.loc[aug, "edd30_jul"] == pytest.approx(ia.loc["2011-07-01":"2011-07-31", "edd30"].sum())
+
+
+def test_weather_three_day_lag_in_panel(syn_inputs, syn_panel):
+    """Row d sees weather only through d-3 (NASA POWER lag), never d-1 or d-2."""
+    assert weather.WEATHER_LAG_DAYS == 3
+    assert F.WEATHER_MAX_STALENESS_DAYS >= weather.WEATHER_LAG_DAYS
+    w = syn_inputs["weather"]
+    ia = w[w["state"] == "IA"].set_index("date")
+    g = syn_panel[syn_panel["geo"] == "IA"].set_index("date")
+    d = pd.Timestamp("2011-07-20")
+    d3, d1 = d - pd.Timedelta(days=3), d - pd.Timedelta(days=1)
+    assert g.loc[d, "edd30_cum"] == pytest.approx(ia.loc[d3, "edd30_cum"])
+    assert g.loc[d, "edd30_cum"] != pytest.approx(ia.loc[d1, "edd30_cum"])
+    assert (g["weather_asof"].dropna() <= g["weather_asof"].dropna().index.to_series()).all()
+    # a weather outage: rows are blank once the newest day is older than the staleness limit
+    ww = w[~((w["date"] >= "2011-07-01") & (w["date"] <= "2011-07-31"))]
+    p = F.build_features(syn_inputs["modis"], ww, None, seasons=[2011])
+    gi = p[p["geo"] == "IA"].set_index("date")
+    stale_from = pd.Timestamp("2011-06-30") + pd.Timedelta(days=F.WEATHER_MAX_STALENESS_DAYS + 1)
+    assert pd.notna(gi.loc[stale_from - pd.Timedelta(days=1), "gdd_cum"])
+    assert np.isnan(gi.loc[stale_from, "gdd_cum"])
+
+
+# --- US aggregate composition -------------------------------------------------------
+def test_us_n_states_columns(syn_inputs):
+    m = syn_inputs["modis"]
+    m = m[m["state"] != "IL"]  # one state never has MODIS
+    w = syn_inputs["weather"]
+    w = w[~((w["state"] == "NE") & (w["date"] >= "2012-07-01") & (w["date"] <= "2012-07-31"))]
+    p = F.build_features(m, w, None, seasons=[2012])
+    us = p[p["geo"] == "US"].set_index("date")
+    st = p[p["geo"] != "US"]
+    exp_m = st.groupby("date")["ndvi_anom"].apply(lambda s: s.notna().sum())
+    exp_w = st.groupby("date")["gdd_cum_anom"].apply(lambda s: s.notna().sum())
+    pd.testing.assert_series_equal(us["us_n_states_modis"], exp_m, check_names=False,
+                                   check_dtype=False)
+    pd.testing.assert_series_equal(us["us_n_states_weather"], exp_w, check_names=False,
+                                   check_dtype=False)
+    assert us["us_n_states_modis"].max() == 4 and us["us_n_states_weather"].min() < 5
+    assert us["us_n_states_weather"].max() == 5
+    # the aggregation itself is unchanged: still the renormalised weighted mean
+    d = pd.Timestamp("2012-07-20")
+    rows = p[p["date"] == d].set_index("geo")
+    have = [s for s in STATES if pd.notna(rows.loc[s, "ndvi_anom"])]
+    wt = F.us_weights(have)
+    assert rows.loc["US", "ndvi_anom"] == pytest.approx(sum(wt[s] * rows.loc[s, "ndvi_anom"] for s in have))
+    # carried into the trading table (US columns only, no per-state copies)
+    zcz = pd.DataFrame({"date": pd.to_datetime(["2012-07-20"]), "contract": "ZCZ12",
+                        "campaign": 2012, "close": 600.0, "ret": 0.0, "days_to_expiry": 100})
+    t = F.build_trading(p, zcz)
+    assert t.loc[0, "us_n_states_modis"] == 4 and t.loc[0, "us_n_states_weather"] == 4
+    assert "us_n_states_modis_ia" not in t.columns
 
 
 # --- trading table ------------------------------------------------------------------

@@ -11,14 +11,31 @@ from cornsat.config import DATA_PROCESSED, DATA_RAW
 FRONT_START = pd.Timestamp("2009-01-02")
 
 
+def download_date(path: Path, footer: str | None = None) -> pd.Timestamp | None:
+    """Download date of a Barchart export: the ``MM-DD-YYYY`` in the file name
+    (``..._historical-data-11-05-2026.csv``), else the ``as of MM-DD-YYYY`` of the footer
+    line. None if neither parses."""
+    m = re.search(r"(\d{2})-(\d{2})-(\d{4})\.csv$", Path(path).name.lower())
+    if not m and footer:
+        m = re.search(r"as of (\d{2})-(\d{2})-(\d{4})", footer)
+    if not m:
+        return None
+    return pd.Timestamp(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+
+
 def read_contract(path: Path) -> pd.DataFrame:
-    """Read one Barchart CSV and return normalized, ascending columns."""
+    """Read one Barchart CSV and return normalized, ascending columns.
+
+    A row dated on the file's download date is dropped: the export was taken during/before
+    that session, so the bar is a partial intraday snapshot, not a settled close."""
     path = Path(path)
     m = re.search(r"zcz(\d{2})", path.name.lower())
     if not m:
         raise ValueError(f"cannot parse campaign year from {path.name}")
     campaign = 2000 + int(m.group(1))
     raw = pd.read_csv(path, dtype=str)
+    footer = raw["Time"][raw["Time"].str.startswith("Downloaded", na=False)]
+    dl = download_date(path, footer.iloc[-1] if len(footer) else None)
     raw = raw[~raw["Time"].str.startswith("Downloaded", na=False)].copy()
     raw = raw.dropna(subset=["Time"])
     df = pd.DataFrame(
@@ -34,6 +51,8 @@ def read_contract(path: Path) -> pd.DataFrame:
             "oi": raw["Open Int"].astype("int64"),
         }
     )
+    if dl is not None:
+        df = df[df["date"] < dl]
     df = df.drop_duplicates().drop_duplicates(subset="date", keep="first")
     df = df.sort_values("date").reset_index(drop=True)
     df["contract"] = f"ZCZ{campaign % 100:02d}"
