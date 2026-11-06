@@ -1,9 +1,77 @@
+<p align="center"><img src="docs/img/hero.png" alt="NASA HLS 30 m true colour and NDVI of a central Iowa corn block, 30 July 2023" width="100%"></p>
+
 # CornSat
 
-Does MODIS satellite crop health over the Corn Belt predict US corn yield surprises and
+Does satellite crop health over the Corn Belt predict US corn yield surprises and
 December corn futures (ZCZ), beyond what weather and USDA crop condition already tell us?
 
-**Short answer: no.** 2009-2026, walk-forward, after costs. See [Results](#results).
+**Short answer: no.** Neither 250 m MODIS nor 30 m NASA HLS imagery adds a reliable edge.
+2009-2026, walk-forward, after costs. See [Results at a glance](#results-at-a-glance) and
+[`reports/phase8_results.md`](reports/phase8_results.md).
+
+## How it works
+
+```mermaid
+flowchart LR
+    B[Barchart CSVs] --> P[prices<br/>zcz_front_dec]
+    CDL[USDA CDL] --> M[cornmask<br/>MODIS grid, corn fraction]
+    CDL --> HM[hlssample<br/>360 blocks, rotation corn masks]
+    MPC[Planetary Computer] --> MO[modis<br/>state NDVI/EVI, 250 m]
+    M --> MO
+    ED[NASA Earthdata] --> H[hls<br/>state NDVI, 30 m, L30 + S30]
+    HM --> H
+    PW[NASA POWER] --> W[weather<br/>GDD, EDD, precip anomalies]
+    N[NASS Quick Stats] --> U[usda<br/>condition, progress, yield]
+    P --> F[features<br/>as-of daily panel, lagged]
+    MO --> F
+    H --> F
+    W --> F
+    U --> F
+    F --> SP[state panel<br/>5 states, 2016+, yield RMSE]
+    F --> BT[national backtest<br/>Stage A yield, Stage B trading]
+    P --> BT
+    SP --> R[reports/*.csv, figures]
+    BT --> R
+```
+
+## Imagery
+
+All images are real data, rebuilt by [`scripts/make_readme_visuals.py`](scripts/make_readme_visuals.py).
+
+**30 m versus 250 m.** The same 7.7 km block in central Iowa (Sentinel-2 HLS, 30 Jul 2023;
+Terra MODIS composite 28 Jul to 12 Aug). Outlined: the corn mask predicted from earlier CDL
+years. HLS tracks MODIS closely (state NDVI r = 0.968) and has a higher peak (0.886 vs 0.862)
+because its pixels are purer corn.
+
+![MODIS 250 m versus HLS 30 m NDVI of one block](docs/img/resolution.png)
+
+**The sample.** 360 fixed 256 x 256 pixel blocks (72 per state), chosen once from CDL
+2008-2012 so the choice cannot leak a modelled season.
+
+![360 HLS sample blocks in IA, IL, NE, MN, IN](docs/img/sampling_map.png)
+
+**Derecho, 10 August 2020.** A block north of Cedar Rapids, Iowa, before and after the storm:
+flattened corn shows up as lost greenness.
+
+![Iowa derecho 2020 before and after, true colour and NDVI](docs/img/derecho_2020.png)
+
+**One season.** NDVI of a single block, May to September 2023, cloud-free HLS scenes only.
+
+![One block through the 2023 season, true colour and NDVI](docs/img/season.gif)
+
+## Results at a glance
+
+![Yield RMSE: trend, W+C, W+C+S, W+C+H](docs/img/results.png)
+
+*Phase 8, 5-state panel, 2016+, leave-one-season-out.* Yield RMSE goes from 11.38 (weather +
+crop condition) to 10.86 with MODIS and 11.00 with HLS 30 m (bu/ac): a small, fragile gain over
+W+C, no gain from 30 m over MODIS, gone with a 14-day publication lag, and not tradable
+nationally. Details: [`reports/phase8_results.md`](reports/phase8_results.md).
+
+*National backtest, Stage B, 2014-2026, after costs.* Always-short is the only strategy that
+clears the bootstrap; no model strategy does, with or without satellite features.
+
+![Equity curves of the ZCZ strategies](reports/figures/equity_curves.png)
 
 ## Goal and hypothesis
 
@@ -31,29 +99,11 @@ The analysis is exploratory, not pre-registered (see [Limitations](#limitations)
 | Barchart | ZCZ daily bars, one CSV per contract, 2009-2026 | files in `data/raw/` |
 | MODIS MOD13Q1 / MYD13Q1 v061 | 250 m NDVI/EVI, 16-day composites, Terra + Aqua | Microsoft Planetary Computer (STAC) |
 | USDA CDL | Cropland Data Layer, corn mask per state and year (2008-2025) | USDA download service |
+| NASA HLS v2.0 (HLSL30 + HLSS30) | 30 m Landsat + Sentinel-2 surface reflectance and Fmask, 2013-2026, sampled in 360 blocks | NASA Earthdata (CMR + LP DAAC COGs), needs `EARTHDATA_TOKEN` |
 | NASA POWER | daily Tmax/Tmin/precipitation at 35 corn points | NASA POWER API |
 | USDA NASS Quick Stats | crop condition, progress, yield and forecasts | API, needs `NASS_API_KEY` |
 
 States: IA, IL, NE, MN, IN. The US aggregate is weighted by state.
-
-## Pipeline
-
-```mermaid
-flowchart LR
-    B[Barchart CSVs] --> P[prices<br/>zcz_front_dec]
-    CDL[USDA CDL] --> M[cornmask<br/>corn fraction on MODIS grid]
-    M --> MO[modis<br/>state NDVI/EVI per composite]
-    MPC[Planetary Computer] --> MO
-    PW[NASA POWER] --> W[weather<br/>GDD, EDD, precip anomalies]
-    N[NASS Quick Stats] --> U[usda<br/>condition, progress, yield]
-    P --> F[features<br/>as-of daily panel]
-    MO --> F
-    W --> F
-    U --> F
-    F --> BT[backtest<br/>Stage A ridge + Stage B trading]
-    P --> BT
-    BT --> R[reports/*.csv, figures, notebooks]
-```
 
 ## Setup
 
@@ -62,9 +112,11 @@ Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync
 cp .env.example .env     # then set NASS_API_KEY=... (free key from NASS Quick Stats)
+                         # and EARTHDATA_TOKEN=... (NASA Earthdata "Generate Token", for HLS)
 ```
 
-`.env` is never committed. Only the USDA step needs the key; the rest runs without it.
+`.env` is never committed. The USDA step needs `NASS_API_KEY` and the HLS steps need
+`EARTHDATA_TOKEN`; the rest runs without keys (without a token the HLS step is skipped).
 
 ## Running
 
@@ -72,33 +124,41 @@ cp .env.example .env     # then set NASS_API_KEY=... (free key from NASS Quick S
 uv run python scripts/build_all.py                  # whole pipeline
 uv run python scripts/build_all.py --from features  # features + backtest only (about 30 s)
 uv run python scripts/build_all.py --force          # rebuild the network steps too
-uv run pytest -q                                    # 112 tests
+uv run python scripts/build_hls_sample.py           # HLS blocks + predicted corn masks (CDL)
+uv run python scripts/build_hls.py --pilot          # HLS ingest check: IA, 2024
+uv run python scripts/build_hls.py                  # HLS ingest, 5 states x 2013-2026 (resumable)
+uv run python scripts/run_state_panel.py            # 5-state panel (W, C, S, H feature sets)
+uv run python scripts/make_readme_visuals.py        # rebuild docs/img (cached downloads)
+uv run pytest -q                                    # test suite
 ```
 
-`build_all.py` runs `prices -> cornmask -> modis -> weather -> usda -> features -> backtest`
+`build_all.py` runs
+`prices -> cornmask -> modis -> hls_sample -> hls -> weather -> usda -> features -> backtest`
 and prints the final metrics table from `reports/stageB_summary.csv`. The expensive,
 network-bound steps (cornmask, modis, weather, usda) are skipped when their outputs exist
 unless `--force`; `--from STEP` starts at any step. A cold MODIS build is long (about 4.5
 minutes per season), CDL downloads are large, and both are resumable. Each step also has its
 own script in `scripts/` (`build_prices.py`, `build_cornmask.py`, `build_modis.py`,
-`build_weather.py`, `build_usda.py`, `build_features.py`, `run_backtest.py`).
+`build_hls_sample.py`, `build_hls.py`, `build_weather.py`, `build_usda.py`,
+`build_features.py`, `run_backtest.py`).
 
 ## Repository layout
 
 ```
-src/cornsat/     library: prices, cornmask, modis, weather, usda, features, model, backtest
+src/cornsat/     library: prices, cornmask, modis, hls, hlssample, weather, usda, features, panel, model, backtest
 scripts/         build_all.py (orchestrator) and one script per step
+docs/img/        README images (made by scripts/make_readme_visuals.py)
 notebooks/       00 ingest example, 01 prices, 02 NDVI EDA, 03 features, 04 backtest
-reports/         phase6_design.md, phase6_results.md (source of truth), stage*.csv, figures/
+reports/         phase6_design.md, phase6_results.md, phase8_results.md, stage*.csv, state_panel*.csv, figures/
 tests/           pytest suite (no-look-ahead, truncation, model and backtest tests)
 data/raw/        original downloads, read-only
-data/interim/    caches (corn masks, MODIS per year, NASS responses, weather)
+data/interim/    caches (corn masks, MODIS per year, HLS blocks and scenes, NASS, weather)
 data/processed/  analysis-ready parquet tables (prices, features, predictions, trades)
 ```
 
-## Results
+## Phase 6 results (national, MODIS)
 
-Full detail and every number: [`reports/phase6_results.md`](reports/phase6_results.md);
+Phase 6 detail and every number: [`reports/phase6_results.md`](reports/phase6_results.md);
 figures in `reports/figures/`; walkthrough in `notebooks/04_backtest.ipynb`.
 
 **Verdict: negative.** The satellite features add no measurable yield accuracy, and no model
@@ -173,6 +233,9 @@ and with 16-day composites; the price peaked on Aug 21.
   dominates early fits. Power is low: a gain of about 1 bu/ac RMSE cannot be ruled out.
 - **Reprocessed MODIS (C6.1) and reanalysis weather.** Not the data as it was in real time;
   the lags only model timing. POWER is gridded reanalysis at 35 points.
+- **HLS history is a reconstruction.** HLS 2016-2021 comes from the archive (Landsat 8 plus
+  Sentinel-2 from 2016, thinner early on), reprocessed after the fact; only 2022+ is
+  operational data. 360 blocks sample about 21,000 km2, not whole states.
 - **2025 satellite gap** (MODIS NaN after Aug 10, 2025) and **2026 partial** (no final yield).
 - **Final yields** are later NASS revisions (at most about 0.7 bu/ac off the January
   release). The 2009-2011 USDA release calendar was entered from memory and should be
@@ -183,7 +246,13 @@ and with 16-day composites; the price peaked on Aug 21.
 ## Possible next steps
 
 - County-level analysis instead of five state aggregates.
-- Sentinel-2 / HLS for higher resolution and revisit from 2016.
+- County-level HLS (more blocks) and a real-time HLS vintage test.
 - Real-time (non-reprocessed) MODIS and weather vintages, to test the lag assumptions.
 - Other markets, e.g. soybeans (ZSX).
 - Predict the USDA August Crop Production surprise instead of the price.
+
+## Credits
+
+Imagery: NASA HLS v2.0 (LP DAAC) and USDA NASS Cropland Data Layer, both public domain;
+MODIS MOD13Q1 via Microsoft Planetary Computer. Weather: NASA POWER. Yields and crop
+condition: USDA NASS.
