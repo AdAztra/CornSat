@@ -14,3 +14,4 @@ data/processed/*.parquet
 # Phase 2 caches
 data/interim/boundaries/
 data/interim/cornmask/
+data/interim/hls/
