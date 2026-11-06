@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from cornsat.weather import add_features, compute_edd30, compute_gdd
+from cornsat import weather
+from cornsat.weather import WEATHER_LAG_DAYS, add_features, compute_edd30, compute_gdd
 
 
 def test_gdd_edd_examples():
@@ -45,4 +46,20 @@ def test_missing_is_nan():
 def test_available_date_after_date():
     f = add_features(_frame("2010-06-01", "2010-06-05"))
     assert (f.available_date > f.date).all()
-    assert (f.available_date - f.date == pd.Timedelta(days=1)).all()
+    assert (f.available_date - f.date == pd.Timedelta(days=WEATHER_LAG_DAYS)).all()
+
+
+def test_weather_lag_is_three_days():
+    # NASA POWER: on 2026-11-06 the series ended on 2026-11-03
+    assert WEATHER_LAG_DAYS == 3
+    f = add_features(_frame("2026-11-01", "2026-11-03"))
+    assert f.loc[f.date == "2026-11-03", "available_date"].iloc[0] == pd.Timestamp("2026-11-06")
+
+
+def test_presample_weather_uses_same_lag(monkeypatch):
+    """build_weather_presample (and the US aggregate) go through add_features too."""
+    monkeypatch.setattr(weather, "state_daily",
+                        lambda st, start, end=None: _frame("2007-12-20", "2007-12-31"))
+    out = weather.build_weather_presample(save=False)
+    assert set(out["state"]) >= {"IA", "US"}
+    assert (out["available_date"] - out["date"] == pd.Timedelta(days=3)).all()

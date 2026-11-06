@@ -156,11 +156,12 @@ def level_position(pred, thr: float) -> np.ndarray:
     return np.where(np.abs(np.nan_to_num(p)) > thr, -np.sign(np.nan_to_num(p)), 0.0)
 
 
-def change_position(pred: pd.Series, season: pd.Series, thr: float) -> np.ndarray:
-    """-sign(delta pred vs the previous rebalance of the same season) where |delta| > thr.
-    The first rebalance of a season, and NaN predictions, give 0."""
-    delta = pd.Series(np.asarray(pred, float)).groupby(np.asarray(season)).diff()
-    return level_position(delta.to_numpy(), thr)
+def change_position(delta, thr: float) -> np.ndarray:
+    """-sign(delta) where |delta| > thr. ``delta`` is the same-model change
+    ``model_d(x_d) - model_d(x_prev)`` from ``model.rebalance_predictions``; it is NaN on
+    the first rebalance of a season or when the earlier feature row lacks a column the
+    model uses. NaN gives 0 (flat)."""
+    return level_position(delta, thr)
 
 
 def vs_usda_position(pred, usda, thr: float) -> np.ndarray:
@@ -180,7 +181,7 @@ def compute_signals(feat: pd.DataFrame, targets: pd.DataFrame, forecasts: pd.Dat
                     schedule: pd.DataFrame, sets=TRADE_SETS, alphas=ALPHAS,
                     min_train: int = MIN_TRAIN) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(wide, long). wide: one row per rebalance with the walk-forward prediction per set
-    (``pred_<set>``), flags (``fallback_<set>``, ``sdrop_<set>``) and ``usda`` (latest
+    (``pred_<set>``), the same-model change (``delta_<set>``), flags (``fallback_<set>``, ``sdrop_<set>``) and ``usda`` (latest
     USDA forecast surprise usable at the rebalance date). long: ``rebalance_predictions``."""
     preds = rebalance_predictions(feat, targets, schedule, sets, alphas, min_train)
     wide = schedule.copy()
@@ -191,6 +192,7 @@ def compute_signals(feat: pd.DataFrame, targets: pd.DataFrame, forecasts: pd.Dat
         wide[f"pred_{s}"] = p["pred"].reindex(key).to_numpy()
         wide[f"fallback_{s}"] = p["fallback"].reindex(key).to_numpy()
         wide[f"sdrop_{s}"] = p["s_dropped"].reindex(key).to_numpy()
+        wide[f"delta_{s}"] = p["delta"].reindex(key).to_numpy()
     wide["usda"] = [usda_surprise_at(forecasts, targets, y, d)
                     for y, d in zip(wide["season"], wide["date"])]
     return wide, preds
@@ -203,7 +205,7 @@ def positions_table(signals: pd.DataFrame, sets=TRADE_SETS, thresholds=None) -> 
     for s in sets:
         p = signals[f"pred_{s}"]
         out[f"level|{s}"] = level_position(p, thr["level"])
-        out[f"change|{s}"] = change_position(p, signals["season"], thr["change"])
+        out[f"change|{s}"] = change_position(signals[f"delta_{s}"], thr["change"])
         out[f"vs_usda|{s}"] = vs_usda_position(p, signals["usda"], thr["vs_usda"])
     out["always_short"] = -1.0
     out["always_long"] = 1.0

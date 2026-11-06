@@ -220,8 +220,14 @@ def training_pool(scheme: str, season: int, seasons_with_target: Iterable[int]) 
 
 
 def predict_one(train_X: pd.DataFrame, train_y: pd.Series, x: pd.Series, features: list[str],
-                alphas=ALPHAS, min_train: int = MIN_TRAIN) -> dict:
+                alphas=ALPHAS, min_train: int = MIN_TRAIN,
+                x_prev: pd.Series | None = None) -> dict:
     """Fit on (train_X, train_y) (rows indexed by season) and predict the target row x.
+
+    ``x_prev`` (optional): an earlier feature row of the same season. It is scored with
+    the SAME fitted model, giving ``pred_prev`` and ``delta = pred - pred_prev`` (the
+    "change" signal free of model churn). ``delta`` is NaN when ``x_prev`` is None or is
+    missing any feature column the model uses.
 
     Fallback rules, applied in order:
     1. Features NaN in x are dropped.
@@ -245,13 +251,20 @@ def predict_one(train_X: pd.DataFrame, train_y: pd.Series, x: pd.Series, feature
     has_s = any(f in S_FEATURES for f in features)
     out = {"pred": np.nan, "used": ",".join(used), "fallback": len(used) < len(features),
            "s_dropped": has_s and not any(f in S_FEATURES for f in used),
-           "n_train": 0, "train_seasons": [], "alpha": np.nan}
+           "n_train": 0, "train_seasons": [], "alpha": np.nan,
+           "pred_prev": np.nan, "delta": np.nan}
     if not used:
         return out
     model = fit_ridge(d[used], d["_y"], alphas)
     xt = pd.DataFrame([x[used].astype(float).to_numpy()], columns=used)
     out.update(pred=float(model.predict(xt)[0]), n_train=len(d),
                train_seasons=[int(s) for s in d.index], alpha=float(model["ridge"].alpha_))
+    if x_prev is not None:
+        prev = pd.to_numeric(x_prev.reindex(used), errors="coerce")
+        if prev.notna().all():
+            xp = pd.DataFrame([prev.to_numpy(float)], columns=used)
+            out["pred_prev"] = float(model.predict(xp)[0])
+            out["delta"] = out["pred"] - out["pred_prev"]
     return out
 
 
@@ -302,20 +315,32 @@ def rebalance_predictions(feat: pd.DataFrame, targets: pd.DataFrame, dates: pd.D
     Training rows: each season y < Y (with a target) at its own last row with doy <= the
     doy of ``date`` (the same day of season). The target row is ``feat``'s row on
     ``date`` (must exist). Only rows <= date of season Y and rows of seasons < Y are
-    read."""
+    read.
+
+    ``delta`` (the change signal) = model_d(features at d) - model_d(features at the
+    previous rebalance date of the same season in ``dates``), both scored with the model
+    fitted at d; NaN on a season's first rebalance or when the earlier row lacks a used
+    column (see ``predict_one``)."""
     with_t = _with_targets(targets)
     ax = AsofIndex(feat)
     by_date = feat.set_index("date")
     rows = []
+    prev_date: dict[int, pd.Timestamp] = {}
     for Y, d in zip(dates["season"].astype(int), pd.to_datetime(dates["date"])):
         x = by_date.loc[d]
         if isinstance(x, pd.DataFrame):
             x = x.iloc[-1]
+        x_prev = None
+        if Y in prev_date:
+            x_prev = by_date.loc[prev_date[Y]]
+            if isinstance(x_prev, pd.DataFrame):
+                x_prev = x_prev.iloc[-1]
+        prev_date[Y] = d
         pool = training_pool("wf", Y, with_t)
         tX = ax.rows(pool, int(x["doy"]))
         ty = targets.loc[tX.index, "surprise"]
         for s in sets:
-            r = predict_one(tX, ty, x, FEATURE_SETS[s], alphas, min_train)
+            r = predict_one(tX, ty, x, FEATURE_SETS[s], alphas, min_train, x_prev=x_prev)
             rows.append({"scheme": "wf", "season": Y, "date": d, "set": s, **r})
     return pd.DataFrame(rows)
 
