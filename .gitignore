@@ -9,3 +9,4 @@ __pycache__/
 data/interim/**/*.parquet
 data/interim/**/*.nc
 data/processed/*.parquet
+.claude/
