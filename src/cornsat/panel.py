@@ -91,7 +91,18 @@ WINDOWS: dict[str, tuple[int, tuple[str, ...]]] = {
     "2009+": (2009, ("W", "C", "S")),
     "2016+": (2016, ("W", "C", "S", "H")),
     "2019+": (2019, ("W", "C", "S", "H")),
+    # operational: HLS 2016-2021 is an archive reconstruction (granules produced months to
+    # years after acquisition); near-real-time HLS latency exists only from 2022
+    "2022+": (2022, ("W", "C", "S", "H")),
 }
+HLS_OPERATIONAL_FROM = 2022
+# a scheme whose predictions cover fewer test seasons than this in a window is skipped
+# there (e.g. walk-forward in 2022+: 3 training seasons leave a single test season)
+MIN_TEST_SEASONS = 3
+# event timing: every feature's z uses prior seasons EVENT_FIRST_PRIOR .. event season - 1
+# (2016 = first HLS season), so S, C and H rest on the same seasons
+EVENT_FIRST_PRIOR = 2016
+EVENT_MIN_PRIOR = 3
 EVENTS = [  # (state, season, event date or None, label)
     ("IA", 2020, "2020-08-10", "derecho"),
     ("IA", 2023, None, "2023 dry summer"),
@@ -506,10 +517,13 @@ def paired(preds: pd.DataFrame, pairs=PAIRS, n_boot: int = 5000, seed: int = 0) 
 
 def compare(data: pd.DataFrame, windows=WINDOWS, pairs=PAIRS, schemes=("loso", "wf"),
             alphas=ALPHAS, demean: bool = False, min_train_seasons: int = MIN_TRAIN_SEASONS,
-            group_map: dict[str, list[str]] | None = None, n_boot: int = 5000):
+            group_map: dict[str, list[str]] | None = None, n_boot: int = 5000,
+            min_test_seasons: int = MIN_TEST_SEASONS):
     """All windows: (predictions, accuracy, paired, by_state, skipped) with a ``window``
     column. A window uses the groups of WINDOWS that are available in ``data``; pairs
-    needing a missing group are listed in ``skipped``."""
+    needing a missing group are listed in ``skipped``, and so is a scheme whose
+    predictions in a window cover fewer than ``min_test_seasons`` seasons (its
+    predictions are dropped there; e.g. walk-forward in the short 2022+ window)."""
     gm = GROUPS if group_map is None else group_map
     avail = set(available_groups(data, gm))
     P, A, D, S, skipped = [], [], [], [], []
@@ -526,6 +540,17 @@ def compare(data: pd.DataFrame, windows=WINDOWS, pairs=PAIRS, schemes=("loso", "
         log.info("window %s: groups %s, %d rows, %d seasons", label, groups, len(sample),
                  sample["season"].nunique())
         preds = window_predictions(sample, sets, schemes, alphas, demean, min_train_seasons, gm)
+        if preds.empty:
+            continue
+        n_test = preds.groupby("scheme")["season"].nunique()
+        for sch in schemes:
+            if n_test.get(sch, 0) < min_test_seasons:
+                skipped.append({"window": label, "A": "*", "B": "*", "scheme": sch,
+                                "reason": f"{sch}: {int(n_test.get(sch, 0))} test season(s) < "
+                                          f"{min_test_seasons} (min_train_seasons="
+                                          f"{min_train_seasons}, {sample['season'].nunique()} "
+                                          "seasons in the window)"})
+        preds = preds[preds["scheme"].map(n_test).fillna(0) >= min_test_seasons]
         if preds.empty:
             continue
         preds = preds.assign(window=label)
@@ -545,16 +570,21 @@ def compare(data: pd.DataFrame, windows=WINDOWS, pairs=PAIRS, schemes=("loso", "
 
 # --- event timing -------------------------------------------------------------------------
 def prior_season_z(panel: pd.DataFrame, state: str, season: int, feature: str,
-                   min_prior: int = 3) -> pd.DataFrame:
+                   min_prior: int = 3, first_prior: int | None = None) -> pd.DataFrame:
     """Season ``season`` of ``state``: the feature standardised per day of year by the
-    mean / sd (ddof=1) of that feature on the same DOY in PRIOR seasons only (< season).
-    Columns date, doy, value, prior_mean, prior_sd, n_prior, z."""
+    mean / sd (ddof=1) of that feature on the same DOY in PRIOR seasons only (< season,
+    and >= ``first_prior`` when given). z is NaN where fewer than ``min_prior`` prior
+    seasons have a value. Columns date, doy, value, prior_mean, prior_sd, n_prior, z."""
     p = panel[(panel["geo"] == state) & panel[feature].notna()] if feature in panel else panel.iloc[:0]
     p = p.assign(doy=cal_doy(p["date"]))
     cur = p[p["season"] == season][["date", "doy", feature]].rename(columns={feature: "value"})
-    prior = p[p["season"] < season].groupby("doy")[feature].agg(["mean", "std", "count"])
+    pr = p[p["season"] < season]
+    if first_prior is not None:
+        pr = pr[pr["season"] >= first_prior]
+    prior = pr.groupby("doy")[feature].agg(["mean", "std", "count"])
     prior.columns = ["prior_mean", "prior_sd", "n_prior"]
     out = cur.merge(prior, left_on="doy", right_index=True, how="left")
+    out["n_prior"] = out["n_prior"].fillna(0).astype(int)
     ok = (out["n_prior"] >= min_prior) & (out["prior_sd"] > 0)
     out["z"] = np.where(ok, (out["value"] - out["prior_mean"]) / out["prior_sd"], np.nan)
     return out.sort_values("date").reset_index(drop=True)
@@ -562,21 +592,31 @@ def prior_season_z(panel: pd.DataFrame, state: str, season: int, feature: str,
 
 def first_crossing(panel: pd.DataFrame, state: str, season: int, features: Sequence[str],
                    threshold: float = -1.0, start=None, end=None, event_date=None,
-                   min_prior: int = 3) -> pd.DataFrame:
+                   min_prior: int = 3, first_prior: int | None = None) -> pd.DataFrame:
     """Per feature: first date in [start, end] (default Jun 1 .. Oct 31) on which the
-    prior-season z (``prior_season_z``) is <= threshold, and the first such date on or
-    after ``event_date`` (when given), with lead/lag days relative to the event."""
+    prior-season z (``prior_season_z``, prior seasons ``first_prior`` .. season-1) is <=
+    threshold, and the first such date on or after ``event_date`` (when given), with
+    lead/lag days relative to the event. ``n_prior``: the largest number of prior seasons
+    behind any z of the window; below ``min_prior`` every z (and so every result) is NaN.
+    ``prior_seasons``: first-last prior season actually used."""
     start = pd.Timestamp(season, 6, 1) if start is None else pd.Timestamp(start)
     end = pd.Timestamp(season, 10, 31) if end is None else pd.Timestamp(end)
     ev = None if event_date is None else pd.Timestamp(event_date)
     rows = []
     for f in features:
-        z = prior_season_z(panel, state, season, f, min_prior)
+        z = prior_season_z(panel, state, season, f, min_prior, first_prior)
         z = z[(z["date"] >= start) & (z["date"] <= end)]
         hit = z[z["z"] <= threshold]
+        ps = (panel[(panel["geo"] == state) & (panel["season"] < season)
+                    & (panel["date"].dt.month.between(start.month, end.month))]
+              if f in panel else panel.iloc[:0])
+        if first_prior is not None:
+            ps = ps[ps["season"] >= first_prior]
+        ps = sorted(ps.loc[ps[f].notna(), "season"].unique()) if len(ps) else []
         r = {"state": state, "season": season, "feature": f, "threshold": threshold,
              "event_date": ev, "n_days": int(z["z"].notna().sum()),
-             "n_prior": int(z["n_prior"].max()) if len(z) and z["n_prior"].notna().any() else 0,
+             "n_prior": int(z["n_prior"].max()) if len(z) else 0,
+             "prior_seasons": f"{ps[0]}-{ps[-1]}" if ps else "",
              "first_cross": hit["date"].iloc[0] if len(hit) else pd.NaT,
              "z_at_cross": float(hit["z"].iloc[0]) if len(hit) else np.nan,
              "min_z": float(z["z"].min()) if z["z"].notna().any() else np.nan,
@@ -598,11 +638,24 @@ def first_crossing(panel: pd.DataFrame, state: str, season: int, features: Seque
 
 
 def event_table(panel: pd.DataFrame, events=EVENTS, groups=("S", "C", "H"),
-                group_map: dict[str, list[str]] | None = None) -> pd.DataFrame:
-    """``first_crossing`` for each event and the features of the available ``groups``."""
+                group_map: dict[str, list[str]] | None = None,
+                first_prior: int | None = EVENT_FIRST_PRIOR, min_prior: int = EVENT_MIN_PRIOR
+                ) -> pd.DataFrame:
+    """``first_crossing`` for each event and the features of the available ``groups``.
+
+    Every feature is standardised against the SAME prior seasons, ``first_prior`` (default
+    2016, the first HLS season) .. event season - 1, so the groups' z-scores rest on
+    equally many seasons (a short history inflates |z| through a noisy sd). Features
+    with fewer than ``min_prior`` prior seasons get NaN (``n_prior`` reports the count)."""
     gm = GROUPS if group_map is None else group_map
     avail = available_groups(panel, gm)
     feats = [f for g in groups if g in avail for f in gm[g]]
-    out = [first_crossing(panel, s, y, feats, event_date=ev).assign(event=lab)
+    group_of = {f: g for g in groups if g in avail for f in gm[g]}
+    out = [first_crossing(panel, s, y, feats, event_date=ev, min_prior=min_prior,
+                          first_prior=first_prior).assign(event=lab)
            for s, y, ev, lab in events]
-    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+    if not out:
+        return pd.DataFrame()
+    df = pd.concat(out, ignore_index=True)
+    df.insert(df.columns.get_loc("feature"), "group", df["feature"].map(group_of))
+    return df

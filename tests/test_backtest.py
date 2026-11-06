@@ -244,3 +244,34 @@ def test_h_signals_and_hdrop_flags_with_hls_columns():
     feat0, tg0, fc0, sched0 = _signals_inputs()
     sig0, _ = B.compute_signals(feat0, tg0, fc0, sched0)
     pd.testing.assert_frame_equal(sig0, sig[sig0.columns])
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")  # 1-week toy seasons: Sharpe undefined
+def test_sat_shared_table_uses_only_seasons_where_both_predict():
+    seasons = [2018, 2019, 2020, 2021]
+    sig = pd.DataFrame({"season": np.repeat(seasons, 2),
+                        "date": pd.to_datetime([f"{y}-06-{d:02d}" for y in seasons for d in (2, 9)])})
+    nan = np.nan
+    sig["pred_W+C"] = 1.0
+    sig["pred_W+C+S"], sig["sdrop_W+C+S"] = 1.0, False
+    sig["pred_S"], sig["sdrop_S"] = 1.0, False
+    # H: no H history in 2018 (dropped -> = W+C), NaN in 2019, valid 2020-21
+    sig["pred_W+C+H"] = 1.0
+    sig["hdrop_W+C+H"] = sig["season"] <= 2018
+    sig["pred_H"] = np.where(sig["season"] <= 2019, nan, 1.0)
+    sig["hdrop_H"] = sig["season"] <= 2019
+    # S dropped on every 2021 rebalance -> 2021 not shared either
+    sig.loc[sig["season"] == 2021, "sdrop_W+C+S"] = True
+    assert B.valid_prediction_seasons(sig, "W+C+H") == {2019, 2020, 2021}
+    assert B.shared_sat_seasons(sig) == [2020]
+    pnl = {"W+C": 10.0, "W+C+S": 30.0, "S": -5.0, "W+C+H": 50.0, "H": 0.0}
+    res = {}
+    for s, v in pnl.items():
+        w = pd.DataFrame({"season": seasons, "net": [v + 1000 * (y != 2020) for y in seasons],
+                          "notional": 20_000.0})
+        res[f"level|{s}"] = (None, w)
+    t = B.sat_shared_table(res, sig, n_boot=200, signals_list=["level"]).iloc[0]
+    assert t["n_seasons"] == 1 and t["seasons"] == "2020"
+    assert t["pnl_W+C+S"] == 30 and t["pnl_W+C+H"] == 50 and t["pnl_W+C"] == 10
+    assert t["diff_WCH_minus_WCS"] == 20 and t["diff_W+C+S_vs_W+C"] == 20
+    assert t["seasons_H_better"] == 1 and t["seasons_S_better"] == 0

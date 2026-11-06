@@ -277,3 +277,40 @@ def test_paired_comparison_skips_pairs_with_missing_sets():
     assert set(zip(pc["base"], pc["with_s"])) == {("W+C", "W+C+S"), ("W", "W+S"), ("C", "C+S")}
     assert "seasons" in pc.columns
     assert M.paired_comparison(preds.iloc[0:0], scheme="wf").empty
+
+
+def test_paired_comparison_applies_same_drop_rule_to_s_and_h():
+    raw, tg = synth_features(seasons=range(2009, 2027), hls_from=2016)
+    tg.loc[2026, "surprise"] = np.nan
+    # S unavailable in the last season with a target (like 2025 after Aug 10)
+    s_feats = M.FEATURE_GROUPS["S"]
+    raw.loc[raw["campaign"] == 2025, s_feats] = np.nan
+    _, preds = _stage_a(raw, tg)
+    wf = preds[preds["scheme"] == "wf"]
+    assert wf[(wf["set"] == "W+C+S") & (wf["season"] == 2025)]["s_dropped"].all()
+    pc = M.paired_comparison(preds, scheme="wf")
+    for b in ("W+C+S", "W+S", "C+S"):
+        r = pc[(pc["with_s"] == b) & (pc["snapshot"] == "ALL")].iloc[0]
+        assert not r["seasons"].endswith("2025")  # the s_dropped cell is excluded
+    kept = M.drop_sat_dropped(wf)
+    assert not ((kept["set"] == "W+C+S") & (kept["season"] == 2025)).any()
+    assert ((kept["set"] == "W+C") & (kept["season"] == 2025)).any()  # no S: untouched
+
+
+def test_threeway_uses_cells_where_all_three_predict():
+    raw, tg = synth_features(seasons=range(2009, 2027), hls_from=2016)
+    tg.loc[2026, "surprise"] = np.nan
+    raw.loc[raw["campaign"] == 2025, M.FEATURE_GROUPS["S"]] = np.nan  # S dropped in 2025
+    _, preds = _stage_a(raw, tg)
+    t = M.threeway_comparison(preds, scheme="wf")
+    assert set(zip(t["base"], t["with_s"])) == {("W+C", "W+C+S"), ("W+C", "W+C+H"),
+                                                ("W+C+S", "W+C+H")}
+    allr = t[t["snapshot"] == "ALL"]
+    # same cells for every pair: H from 2016 + MIN_TRAIN, 2025 out (S dropped)
+    assert allr["n"].nunique() == 1 and allr["seasons"].nunique() == 1
+    h0 = 2016 + M.MIN_TRAIN
+    assert allr["seasons"].iloc[0] == f"{h0}-2024" and allr["n"].iloc[0] == 2024 - h0 + 1
+    r = allr.set_index(["base", "with_s"])
+    assert r.loc[("W+C", "W+C+S"), "rmse_base"] == pytest.approx(r.loc[("W+C", "W+C+S"), "rmse_W+C"])
+    assert r.loc[("W+C+S", "W+C+H"), "rmse_with_s"] == pytest.approx(
+        r.loc[("W+C", "W+C+H"), "rmse_W+C+H"])

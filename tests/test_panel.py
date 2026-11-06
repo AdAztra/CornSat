@@ -276,3 +276,55 @@ def test_event_timing_uses_prior_season_sigma_only():
     assert r["first_cross"] == pd.Timestamp("2020-08-20") and not r["below_at_event"]
     assert r["first_cross_after_event"] == pd.Timestamp("2020-08-20")
     assert r["days_after_event"] == 10
+
+
+def test_event_table_uses_same_prior_seasons_for_every_group():
+    """S (history from 2009) and H (history from 2016) are standardised on the SAME prior
+    seasons 2016 .. event-1, so their z-scores rest on equally many seasons."""
+    rng = np.random.default_rng(4)
+    parts = []
+    for y in range(2009, 2026):
+        d = pd.date_range(f"{y}-06-01", f"{y}-10-31", freq="D")
+        row = {"geo": "IA", "date": d, "season": y}
+        for g in ("S", "C", "H"):
+            for f in P.GROUPS[g]:
+                row[f] = rng.normal(0, 1, len(d)) * 0.2 + rng.normal()
+                if g == "H" and y < 2016:
+                    row[f] = np.full(len(d), np.nan)  # HLS starts 2016
+        parts.append(pd.DataFrame(row))
+    panel = pd.concat(parts, ignore_index=True)
+    events = [("IA", 2020, "2020-08-10", "a"), ("IA", 2023, None, "b"), ("IA", 2018, None, "c")]
+    t = P.event_table(panel, events=events)
+    assert {"n_prior", "prior_seasons", "group"} <= set(t.columns)
+    assert set(t["group"]) == {"S", "C", "H"}
+    for ev, n, span in (("a", 4, "2016-2019"), ("b", 7, "2016-2022")):
+        e = t[t["event"] == ev]
+        assert (e["n_prior"] == n).all() and (e["prior_seasons"] == span).all()
+        assert e["min_z"].notna().all()
+    # 2018: only 2016-2017 before it -> below the minimum, every result NaN
+    c = t[t["event"] == "c"]
+    assert (c["n_prior"] == 2).all() and c["min_z"].isna().all() and c["first_cross"].isna().all()
+    # the S z for 2020 equals the z computed from 2016-2019 only
+    f = P.GROUPS["S"][0]
+    z = P.prior_season_z(panel, "IA", 2020, f, first_prior=2016).iloc[40]
+    pr = panel[(panel["season"] >= 2016) & (panel["season"] < 2020)]
+    vals = pr[pr["date"].dt.strftime("%m-%d") == z["date"].strftime("%m-%d")][f]
+    assert z["n_prior"] == 4 and z["prior_sd"] == pytest.approx(vals.std(ddof=1))
+    # without the common window S would use all 11 seasons since 2009
+    assert P.prior_season_z(panel, "IA", 2020, f).iloc[40]["n_prior"] == 11
+
+
+def test_short_window_skips_walk_forward_cleanly():
+    """2022+ (4 seasons with a target): LOSO is evaluated; walk-forward (3 training seasons
+    needed) would leave a single test season, so it is skipped and reported."""
+    d = synth_data(groups=("W", "C", "S", "H"), seasons=range(2014, 2026))
+    assert "2022+" in P.WINDOWS and P.WINDOWS["2022+"][0] == 2022
+    windows = {"2019+": (2019, ("W", "C", "S", "H")), "2022+": P.WINDOWS["2022+"]}
+    preds, _, pair, _, skipped = P.compare(d, windows=windows, n_boot=100)
+    w22 = preds[preds["window"] == "2022+"]
+    assert set(w22["scheme"]) == {"loso"} and set(w22["season"]) == {2022, 2023, 2024, 2025}
+    assert set(pair.loc[pair["window"] == "2022+", "scheme"]) == {"loso"}
+    sk = skipped[skipped["window"] == "2022+"]
+    assert list(sk["scheme"]) == ["wf"]
+    # the longer window keeps both schemes
+    assert set(preds.loc[preds["window"] == "2019+", "scheme"]) == {"loso", "wf"}

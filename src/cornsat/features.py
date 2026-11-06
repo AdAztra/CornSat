@@ -617,7 +617,8 @@ def _append_sat(panel: pd.DataFrame, sat: pd.DataFrame, seasons, spec: SatSpec
 
 
 def build_features(modis: pd.DataFrame, weather: pd.DataFrame, usda: dict | None = None,
-                   seasons=None, hls: pd.DataFrame | None = None) -> pd.DataFrame:
+                   seasons=None, hls: pd.DataFrame | None = None,
+                   hls_spec: SatSpec | None = None) -> pd.DataFrame:
     """Daily as-of panel (long; see module doc) from PRE-LOADED input frames.
 
     ``modis``: modis_state rows (sample and pre-sample seasons concatenated; the stored
@@ -630,6 +631,10 @@ def build_features(modis: pd.DataFrame, weather: pd.DataFrame, usda: dict | None
     exactly the MODIS-only panel. Every input row is used only on dates >= its
     availability date, so passing frames truncated at date d yields identical values
     for all rows dated <= d (the truncation test relies on this).
+    ``hls_spec``: override of ``HLS_SPEC`` for the HLS block (e.g.
+    ``dataclasses.replace(HLS_SPEC, lag_days=14)`` for a lag-sensitivity run); None (the
+    default) uses ``HLS_SPEC`` unchanged. The block's column names come from the spec, so
+    an override must keep ``name`` / ``prefix``.
     """
     seasons = list(YEARS if seasons is None else seasons)
     mp = prepare_sat(modis, MODIS_SPEC)
@@ -673,7 +678,7 @@ def build_features(modis: pd.DataFrame, weather: pd.DataFrame, usda: dict | None
     panel = panel.sort_values(["geo", "date"]).reset_index(drop=True)
     panel["geo"] = panel["geo"].astype(str)
     if hls is not None:
-        panel = _append_sat(panel, hls, seasons, HLS_SPEC)
+        panel = _append_sat(panel, hls, seasons, HLS_SPEC if hls_spec is None else hls_spec)
     return panel
 
 

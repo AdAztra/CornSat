@@ -348,3 +348,62 @@ def random_sign_tests(weekly: pd.DataFrame, n: int = 5_000, seed: int = 1) -> di
             "p_random_own": (1 + (own >= actual).sum()) / (n + 1),
             "random_full_median": float(np.median(full)),
             "random_full_p95": float(np.percentile(full, 95))}
+
+
+# --- satellite groups on shared seasons --------------------------------------------------
+SHARED_SAT_SETS = ("W+C+S", "S", "W+C+H", "H")
+
+
+def valid_prediction_seasons(signals: pd.DataFrame, s: str) -> set[int]:
+    """Seasons with at least one rebalance where set ``s`` has a prediction that really
+    uses each of its satellite groups (pred not NaN and ``<g>drop_<s>`` False for every
+    group g of the set): the same drop rule as ``model.drop_sat_dropped``."""
+    if f"pred_{s}" not in signals:
+        return set()
+    ok = signals[f"pred_{s}"].notna()
+    for g in SAT_GROUPS:
+        if g in s.split("+") and f"{g.lower()}drop_{s}" in signals:
+            ok &= ~signals[f"{g.lower()}drop_{s}"].fillna(False).astype(bool)
+    return {int(y) for y in signals.loc[ok, "season"]}
+
+
+def shared_sat_seasons(signals: pd.DataFrame, sets=SHARED_SAT_SETS) -> list[int]:
+    """Seasons in which EVERY set of ``sets`` has a valid prediction
+    (``valid_prediction_seasons``), so S- and H-strategies are compared like for like.
+    Empty when a set is absent."""
+    out = None
+    for s in sets:
+        v = valid_prediction_seasons(signals, s)
+        out = v if out is None else out & v
+    return sorted(out or [])
+
+
+def sat_shared_table(results: dict, signals: pd.DataFrame, n_boot: int = 10_000,
+                     sets=SHARED_SAT_SETS, base: str = "W+C", signals_list=SIGNALS) -> pd.DataFrame:
+    """Per signal, net P&L on the shared seasons (``shared_sat_seasons``) of the
+    no-satellite strategy (``<sig>|W+C``) and every satellite strategy; differences vs the
+    no-satellite one; and W+C+H vs W+C+S (season-block bootstrap CI, P(diff <= 0)).
+    Empty when there is no shared season or a strategy is missing."""
+    seasons = shared_sat_seasons(signals, sets)
+    if not seasons:
+        return pd.DataFrame()
+    rows = []
+    for sig in signals_list:
+        names = {s: f"{sig}|{s}" for s in (base, *sets)}
+        if any(n not in results for n in names.values()):
+            continue
+        wk = {s: results[n][1][results[n][1]["season"].isin(seasons)] for s, n in names.items()}
+        tot = {s: w.groupby("season")["net"].sum().reindex(seasons, fill_value=0.0)
+               for s, w in wk.items()}
+        r = {"signal": sig, "n_seasons": len(seasons), "seasons": ",".join(map(str, seasons))}
+        r.update({f"pnl_{s}": float(t.sum()) for s, t in tot.items()})
+        for s in sets:
+            r[f"diff_{s}_vs_{base}"] = float((tot[s] - tot[base]).sum())
+        if "W+C+H" in sets and "W+C+S" in sets:
+            bs = block_bootstrap(wk["W+C+H"], n_boot, seed=5, other=wk["W+C+S"])
+            r.update({"diff_WCH_minus_WCS": bs["diff"], "diff_lo": bs["diff_lo"],
+                      "diff_hi": bs["diff_hi"], "p_diff_le0": bs["p_diff_le0"],
+                      "seasons_H_better": int((tot["W+C+H"] > tot["W+C+S"]).sum()),
+                      "seasons_S_better": int((tot["W+C+H"] < tot["W+C+S"]).sum())})
+        rows.append(r)
+    return pd.DataFrame(rows)

@@ -394,6 +394,20 @@ PAIRS = (("W+C", "W+C+S"), ("W", "W+S"), ("C", "C+S"),
          ("W+C", "W+C+H"), ("W+C+S", "W+C+H"), ("S", "H"), ("W", "W+H"), ("C", "C+H"))
 
 
+def drop_sat_dropped(preds: pd.DataFrame) -> pd.DataFrame:
+    """``preds`` without the rows of sets containing a satellite group g (S or H) whose g
+    features were all dropped (``<g>_dropped``): such a prediction is just the model
+    without g (d = 0 against it by construction), not an observation of g. The SAME rule
+    for S (2025 after Aug 10) and H (seasons before enough H history)."""
+    p = preds
+    for g in SAT_GROUPS:
+        col = f"{g.lower()}_dropped"
+        if col in p:
+            has_g = p["set"].str.split("+").apply(lambda gs, g=g: g in gs)
+            p = p[~(has_g & p[col].fillna(False).astype(bool))]
+    return p
+
+
 def paired_comparison(preds: pd.DataFrame, pairs=PAIRS, scheme: str = "wf") -> pd.DataFrame:
     """Paired squared-error comparison, base (A) vs with satellite (B), per snapshot and
     pooled ("ALL": per-season mean over snapshots, so n stays the number of seasons).
@@ -403,14 +417,11 @@ def paired_comparison(preds: pd.DataFrame, pairs=PAIRS, scheme: str = "wf") -> p
     A pair is evaluated only when both sets have predictions, and only on the
     intersection of (snapshot, season) cells where both have a prediction, so pairs
     involving H (whose walk-forward predictions start late) cover fewer seasons. Cells where
-    H was in the set but all its features were dropped (``h_dropped``) are excluded. ``seasons``
-    gives that range (``first-last``, ``n`` seasons for "ALL")."""
-    p = preds[(preds["scheme"] == scheme)].dropna(subset=["pred", "actual"])
-    if "h_dropped" in p:
-        # a set with H whose H features were all dropped is just the model without H (d = 0
-        # by construction): not an H observation, so it is left out of the pair
-        has_h = p["set"].str.split("+").apply(lambda g: "H" in g)
-        p = p[~(has_h & p["h_dropped"].fillna(False).astype(bool))]
+    a set's satellite group (S or H) was in the set but all its features were dropped
+    (``s_dropped`` / ``h_dropped``) are excluded, the same rule for both groups
+    (``drop_sat_dropped``). ``seasons`` gives that range (``first-last``, ``n`` seasons
+    for "ALL")."""
+    p = drop_sat_dropped(preds[(preds["scheme"] == scheme)].dropna(subset=["pred", "actual"]))
     p = p.assign(se=(p["pred"] - p["actual"]) ** 2)
     present = set(p["set"])
     out = []
@@ -444,3 +455,36 @@ def paired_comparison(preds: pd.DataFrame, pairs=PAIRS, scheme: str = "wf") -> p
     order = {k: i for i, k in enumerate([*SNAPSHOTS, "ALL"])}
     return df.sort_values(["base", "with_s", "snapshot"], key=lambda c: c.map(order) if c.name == "snapshot"
                           else c).reset_index(drop=True)
+
+
+THREEWAY_SETS = ("W+C", "W+C+S", "W+C+H")
+
+
+def threeway_comparison(preds: pd.DataFrame, sets=THREEWAY_SETS, scheme: str = "wf"
+                        ) -> pd.DataFrame:
+    """Like-for-like comparison of ``sets`` (default W+C / W+C+S / W+C+H): only the
+    (snapshot, season) cells where EVERY set has a prediction (after ``drop_sat_dropped``)
+    are kept, then ``paired_comparison`` runs W+C -> W+C+S, W+C -> W+C+H and
+    W+C+S -> W+C+H on those same cells. Adds ``rmse_<set>`` for every set on the cells
+    (the "ALL" RMSE is the root of the mean over seasons of the per-season mean squared
+    error, as in ``paired_comparison``), ``n`` = number of seasons."""
+    sets = list(sets)
+    p = drop_sat_dropped(preds[preds["scheme"] == scheme].dropna(subset=["pred", "actual"]))
+    p = p[p["set"].isin(sets)]
+    if p.empty or set(sets) - set(p["set"]):
+        return pd.DataFrame()
+    cnt = p.groupby(["snapshot", "season"])["set"].nunique()
+    full = cnt[cnt == len(sets)].index
+    key = pd.MultiIndex.from_frame(p[["snapshot", "season"]])
+    p = p[key.isin(full)]
+    if p.empty:
+        return pd.DataFrame()
+    pairs = [(a, b) for i, a in enumerate(sets) for b in sets[i + 1:]]
+    pc = paired_comparison(p, pairs=pairs, scheme=scheme)
+    se = p.assign(se=(p["pred"] - p["actual"]) ** 2).pivot_table(
+        index=["snapshot", "season"], columns="set", values="se")[sets]
+    rm = {snap: np.sqrt(g.mean()) for snap, g in se.groupby(level="snapshot", sort=False)}
+    rm["ALL"] = np.sqrt(se.groupby(level="season").mean().mean())
+    for s in sets:
+        pc[f"rmse_{s}"] = pc["snapshot"].map({k: float(v[s]) for k, v in rm.items()})
+    return pc

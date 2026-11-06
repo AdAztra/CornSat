@@ -9,6 +9,11 @@ final-yield history 1990-2008 (NASS Quick Stats, cached to
 data/interim/state_final_yields.parquet). Writes state_panel_accuracy.csv,
 state_panel_paired.csv, state_panel_by_state.csv and state_panel_events.csv. Design:
 module docstring of cornsat.panel.
+
+Caveat: HLS (group H) 2016-2021 is an archive reconstruction (granules produced months to
+years after acquisition); only from 2022 does HLS have real-time latency. The 2022+ window
+("operational") uses only those seasons (LOSO only: walk-forward is skipped there because
+too few test seasons remain).
 """
 
 from __future__ import annotations
@@ -47,6 +52,10 @@ def main(argv=None) -> None:
           f"({targets.dropna(subset=['surprise'])['season'].min()}-"
           f"{targets.dropna(subset=['surprise'])['season'].max()})")
 
+    print(f"\nNOTE: H (HLS) results for seasons before {P.HLS_OPERATIONAL_FROM} use reconstructed "
+          f"archive data (granules produced months to years after acquisition), not data as it "
+          f"was available in real time. Only the {P.HLS_OPERATIONAL_FROM}+ window is operational.")
+
     _, acc, pair, bystate, skipped = P.compare(data, demean=args.demean, n_boot=args.n_boot)
     events = P.event_table(panel)
 
@@ -70,11 +79,19 @@ def main(argv=None) -> None:
     print(a.pivot_table(index=["window", "scheme", "set"], columns="snapshot", values="rmse")
           .reindex(columns=[*P.SNAPSHOTS, "ALL"]).round(2).to_string())
     if len(skipped):
-        print(f"\nskipped (missing group): {len(skipped)} window-pairs, e.g. "
-              f"{skipped.iloc[0]['window']} {skipped.iloc[0]['A']} vs {skipped.iloc[0]['B']}")
-    print("\nEvent timing (first prior-season z <= -1)")
-    ecols = ["event", "state", "season", "feature", "first_cross", "z_at_cross",
-             "below_at_event", "first_cross_after_event", "days_after_event", "min_z", "min_z_date"]
+        grp = skipped[skipped["A"] != "*"]
+        if len(grp):
+            print(f"\nskipped (missing group): {len(grp)} window-pairs, e.g. "
+                  f"{grp.iloc[0]['window']} {grp.iloc[0]['A']} vs {grp.iloc[0]['B']}")
+        for _, r in skipped[skipped["A"] == "*"].iterrows():
+            print(f"skipped scheme in window {r['window']}: {r['reason']}")
+    print(f"\nNOTE: H rows before {P.HLS_OPERATIONAL_FROM} (windows 2016+, 2019+) use reconstructed "
+          f"archive HLS; see the {P.HLS_OPERATIONAL_FROM}+ window for the operational test.")
+    print(f"\nEvent timing (first prior-season z <= -1; every feature standardised on the same "
+          f"prior seasons {P.EVENT_FIRST_PRIOR}..event-1, NaN when n_prior < {P.EVENT_MIN_PRIOR})")
+    ecols = ["event", "state", "season", "group", "feature", "n_prior", "prior_seasons",
+             "first_cross", "z_at_cross", "below_at_event", "first_cross_after_event",
+             "days_after_event", "min_z", "min_z_date"]
     e = events[[c for c in ecols if c in events]]
     print(e.round({c: 2 for c in e.select_dtypes("number")}).to_string(index=False))
 
