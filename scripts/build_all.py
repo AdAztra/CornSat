@@ -1,6 +1,7 @@
 """Run the CornSat pipeline end to end.
 
-Steps, in order: prices -> cornmask -> modis -> weather -> usda -> features -> backtest.
+Steps, in order: prices -> cornmask -> modis -> hls_sample -> hls -> weather -> usda -> features
+-> backtest.
 
 Usage:
     uv run python scripts/build_all.py                  # everything; skips expensive steps
@@ -9,8 +10,10 @@ Usage:
     uv run python scripts/build_all.py --force          # rebuild the expensive steps too
                                                         # (re-downloads CDL, MODIS, POWER, NASS)
 
-prices, features and backtest are cheap and always run when selected. cornmask, modis, weather
-and usda hit the network; they are skipped when their outputs exist unless --force.
+prices, features and backtest are cheap and always run when selected. cornmask, modis, hls_sample,
+hls, weather and usda hit the network; they are skipped when their outputs exist unless --force.
+hls needs EARTHDATA_TOKEN in .env; without a valid token the hls step is skipped (HLS features
+are then absent and the H sets are skipped downstream) and the pipeline continues.
 Ends by printing the headline metrics from reports/stageB_summary.csv.
 """
 
@@ -28,7 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling build_*.py s
 
 from cornsat.config import DATA_PROCESSED, STATES, YEARS  # noqa: E402
 
-STEPS = ["prices", "cornmask", "modis", "weather", "usda", "features", "backtest"]
+STEPS = ["prices", "cornmask", "modis", "hls_sample", "hls", "weather", "usda", "features",
+         "backtest"]
 
 
 def _run_main(module: str, argv: list[str] | None = None):
@@ -68,6 +72,32 @@ def step_modis(force: bool) -> None:
         for y in YEARS:
             modis.build_year(y, STATES, refresh=True)
     _run_main("build_modis")
+
+
+def step_hls_sample(force: bool) -> None:
+    from cornsat import hlssample
+
+    seasons = range(2013, 2027)
+    cached = all(hlssample._mask_path(s, y).exists() for s in STATES for y in seasons)
+    if cached and not force:
+        print(f"skip: all {len(STATES) * len(seasons)} HLS mask caches present")
+        return
+    _run_main("build_hls_sample", ["--refresh"] if force else [])
+
+
+def step_hls(force: bool) -> None:
+    from cornsat import features, hls
+
+    if features.HLS_STATE_PATH.exists() and not force:
+        print(f"skip: {features.HLS_STATE_PATH.name} exists")
+        return
+    try:
+        hls.token()
+    except hls.EarthdataTokenError as exc:
+        print(f"SKIP hls step: {exc}\n"
+              "HLS features will be absent and H sets are skipped downstream.")
+        return
+    _run_main("build_hls", [])
 
 
 def step_weather(force: bool) -> None:
