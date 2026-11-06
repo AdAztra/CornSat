@@ -388,3 +388,164 @@ def season_weight(state_abbr: str, season_year: int, cdl_years=None) -> xr.DataA
         long_name="corn-fraction weight (mean of prior CDL years)",
     )
     return out
+
+
+# --- raw CDL class codes in a small window (Phase 8b, HLS block masks) ---------------
+# Additive helpers: nothing above depends on them. They return the *raw* CDL class codes
+# (not only corn) for an EPSG:5070 bounding box on the native 30 m CDL grid.
+SOY_CLASS = 5
+_GDAL_HTTP_ENV = {
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.tiff",
+    "GDAL_HTTP_MAX_RETRY": "4",
+    "GDAL_HTTP_RETRY_DELAY": "2",
+    "GDAL_HTTP_TIMEOUT": "120",
+}
+_cropscape_url_lock = threading.Lock()
+_cropscape_urls: dict[tuple[int, str], str] = {}
+
+
+def _paste_codes(dst: np.ndarray, dst_aff: Affine, ds) -> int:
+    """Read the overlap of open dataset ``ds`` (30 m, aligned) with ``dst``; paste non-zero codes.
+
+    Returns the number of pixels read.
+    """
+    t = ds.transform
+    dx = (dst_aff.c - t.c) / CDL_RES
+    dy = (t.f - dst_aff.f) / CDL_RES
+    if abs(dx - round(dx)) > 1e-3 or abs(dy - round(dy)) > 1e-3 or abs(t.a - CDL_RES) > 1e-6:
+        raise ValueError("CDL source not aligned to the 30 m working grid")
+    col0, row0 = int(round(dx)), int(round(dy))  # dst (0,0) in src pixel coordinates
+    dh, dw = dst.shape
+    c0, c1 = max(col0, 0), min(col0 + dw, ds.width)
+    r0, r1 = max(row0, 0), min(row0 + dh, ds.height)
+    if r0 >= r1 or c0 >= c1:
+        return 0
+    arr = ds.read(1, window=Window(c0, r0, c1 - c0, r1 - r0))
+    sub = dst[r0 - row0 : r1 - row0, c0 - col0 : c1 - col0]
+    np.copyto(sub, arr, where=arr != 0)
+    _count_bytes(arr.size)
+    return int(arr.size)
+
+
+def _with_retries(fn, tries: int = 4):
+    last = None
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"CDL window read failed: {last}")
+
+
+def _pc_cdl_window(dst: np.ndarray, aff: Affine, cdl_year: int) -> int:
+    import planetary_computer as pc
+    import pystac_client
+    from rasterio.warp import transform_bounds
+    from shapely.geometry import box
+
+    h, w = dst.shape
+    bounds = (aff.c, aff.f - h * CDL_RES, aff.c + w * CDL_RES, aff.f)
+    bbox = transform_bounds(CDL_CRS, "EPSG:4326", *bounds, densify_pts=5)
+
+    def search():
+        cat = pystac_client.Client.open(STAC_URL, modifier=pc.sign_inplace)
+        return list(
+            cat.search(
+                collections=["usda-cdl"],
+                bbox=list(bbox),
+                datetime=f"{cdl_year}-01-01/{cdl_year}-12-31",
+                limit=50,
+            ).items()
+        )
+
+    items = [
+        it
+        for it in _with_retries(search)
+        if it.properties.get("usda_cdl:type") == "cropland" and "cropland" in it.assets
+    ]
+    win = box(*bounds)
+    n = 0
+    for it in items:
+        t = Affine(*it.properties["proj:transform"][:6])
+        th, tw = it.properties["proj:shape"]
+        if not box(t.c, t.f - th * CDL_RES, t.c + tw * CDL_RES, t.f).intersects(win):
+            continue
+
+        def read(href=it.assets["cropland"].href):
+            with rasterio.Env(**_GDAL_HTTP_ENV), rasterio.open(href) as ds:
+                return _paste_codes(dst, aff, ds)
+
+        n += _with_retries(read)
+    if n == 0:
+        raise RuntimeError(f"no usda-cdl cropland data for {bounds} in {cdl_year}")
+    return n
+
+
+def _cropscape_state_url(cdl_year: int, fips: str) -> str:
+    """URL of CropScape's cached per-state CDL GeoTIFF (supports HTTP range reads).
+
+    (``GetCDLFile`` also accepts ``bbox=``, but that clips on the fly and returned HTTP 502
+    after ~180 s when tested; the per-state file is pre-built and answers in < 1 s.)
+    """
+    key = (int(cdl_year), fips)
+    with _cropscape_url_lock:
+        if key in _cropscape_urls:
+            return _cropscape_urls[key]
+    xml = _http_get(CROPSCAPE_URL, params={"year": cdl_year, "fips": fips}).decode()
+    m = re.search(r"<returnURL>([^<]+)</returnURL>", xml)
+    if not m:
+        raise RuntimeError(f"CropScape returned no URL for {fips} {cdl_year}: {xml[:300]}")
+    with _cropscape_url_lock:
+        _cropscape_urls[key] = m.group(1)
+    return m.group(1)
+
+
+def _state_of_bounds(bounds_5070) -> str:
+    from shapely.geometry import box
+
+    c = box(*bounds_5070).centroid
+    for st in STATES:
+        if _state_geom_4326(st).to_crs(CDL_CRS).geometry.iloc[0].contains(c):
+            return st
+    raise ValueError(f"bounds {bounds_5070} are not inside any of {list(STATES)}")
+
+
+def _cropscape_window(dst: np.ndarray, aff: Affine, cdl_year: int, state_abbr: str) -> int:
+    url = _cropscape_state_url(cdl_year, _fips(state_abbr))
+
+    def read():
+        with rasterio.Env(**_GDAL_HTTP_ENV), rasterio.open(url) as ds:
+            return _paste_codes(dst, aff, ds)
+
+    n = _with_retries(read)
+    if n == 0:
+        raise RuntimeError(f"CropScape {state_abbr} {cdl_year} does not cover the window")
+    return n
+
+
+def cdl_codes_window(
+    cdl_year: int, bounds_5070, state_abbr: str | None = None
+) -> tuple[np.ndarray, Affine]:
+    """Raw CDL class codes (uint8, 0 = no data) covering an EPSG:5070 bounding box.
+
+    The returned array sits on the native 30 m CDL grid (edges at multiples of 30 m plus
+    15 m), snapped outward to cover ``bounds_5070 = (minx, miny, maxx, maxy)``. Only a
+    window is read: Planetary Computer ``usda-cdl`` COGs for 2008-2021 (mosaicked if the
+    box straddles tiles), CropScape's cached per-state GeoTIFF (HTTP range reads) for
+    2022+. CropScape files are per state, so ``state_abbr`` picks the file (default: the
+    core state containing the box centre); pixels outside that state are 0.
+    """
+    from shapely.geometry import box
+
+    if not CDL_FIRST_YEAR <= cdl_year <= CDL_LAST_YEAR:
+        raise ValueError(f"CDL year {cdl_year} outside {CDL_FIRST_YEAR}-{CDL_LAST_YEAR}")
+    aff, shape = _grid_30m(box(*bounds_5070))
+    codes = np.zeros(shape, dtype="uint8")
+    if cdl_year <= PC_LAST_YEAR:
+        _pc_cdl_window(codes, aff, cdl_year)
+    else:
+        st = state_abbr or _state_of_bounds(bounds_5070)
+        _cropscape_window(codes, aff, cdl_year, st)
+    return codes, aff
