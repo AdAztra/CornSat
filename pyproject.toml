@@ -1,0 +1,39 @@
+[project]
+name = "cornsat"
+version = "0.1.0"
+description = "Dec corn futures and satellite imagery research"
+readme = "README.md"
+authors = [
+    { name = "Luis Duran", email = "luissauco1@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "dask[array]>=2026.8.0",
+    "geopandas>=1.2.0",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "odc-stac>=0.5.3",
+    "pandas>=3.1.1",
+    "planetary-computer>=1.0.0",
+    "pyarrow>=26.0.1",
+    "pystac-client>=0.9.1",
+    "python-dotenv>=1.2.4",
+    "rasterio>=1.5.2",
+    "requests>=2.34.2",
+    "rioxarray>=0.23.0",
+    "scikit-learn>=1.9.1",
+    "shapely>=2.2.0",
+    "statsmodels>=0.15.0",
+    "tqdm>=4.70.1",
+    "xarray>=2026.9.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.4.0",
+    "pytest>=9.2.0",
+]
