@@ -9,3 +9,7 @@ __pycache__/
 data/interim/**/*.parquet
 data/interim/**/*.nc
 data/processed/*.parquet
+
+# Phase 2 caches
+data/interim/boundaries/
+data/interim/cornmask/
